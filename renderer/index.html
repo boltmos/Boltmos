@@ -1,0 +1,91 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Boltmos</title>
+  <style>
+    html, body {
+      margin: 0;
+      padding: 0;
+      overflow: hidden;
+      background: transparent;
+      width: 100%;
+      height: 100%;
+    }
+
+    body {
+      -webkit-app-region: drag;
+    }
+
+    #character-canvas {
+      display: block;
+      width: 100%;
+      height: 100%;
+      background: transparent;
+      -webkit-app-region: no-drag;
+    }
+
+    #speech-bubble {
+      display: none;
+      position: absolute;
+      top: 12px;
+      left: 50%;
+      transform: translateX(-50%);
+      background: white;
+      color: #333;
+      padding: 8px 12px;
+      border-radius: 12px;
+      font-size: 12px;
+      font-family: Arial, sans-serif;
+      max-width: 220px;
+      text-align: center;
+      box-shadow: 0 2px 8px rgba(0, 0, 0, 0.2);
+      -webkit-app-region: no-drag;
+    }
+  </style>
+
+  <!--
+    Electron renderer runs with nodeIntegration: false / contextIsolation: true,
+    so it behaves like a plain browser page. "three" and "@pixiv/three-vrm" use
+    bare module specifiers internally (e.g. `import * as THREE from "three"`),
+    which the browser's ES module resolver cannot resolve on its own. This
+    import map tells it where those bare specifiers point on disk, resolved
+    relative to this HTML file's location (renderer/index.html).
+  -->
+  <script type="importmap">
+    {
+      "imports": {
+        "three": "../node_modules/three/build/three.module.js",
+        "three/addons/": "../node_modules/three/examples/jsm/",
+        "@pixiv/three-vrm": "../node_modules/@pixiv/three-vrm/lib/three-vrm.module.js"
+      }
+    }
+  </script>
+</head>
+<body>
+  <canvas id="character-canvas"></canvas>
+  <div id="speech-bubble"></div>
+
+  <script type="module" src="./renderer.js"></script>
+
+  <script>
+    const speechBubble = document.getElementById('speech-bubble');
+    let speechTimeout = null;
+
+    window.showSpeech = function showSpeech(text, duration = 3000) {
+      speechBubble.textContent = text;
+      speechBubble.style.display = 'block';
+
+      if (speechTimeout) {
+        clearTimeout(speechTimeout);
+      }
+
+      speechTimeout = setTimeout(() => {
+        speechBubble.style.display = 'none';
+        speechTimeout = null;
+      }, duration);
+    };
+  </script>
+</body>
+</html>
