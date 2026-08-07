@@ -8,10 +8,10 @@ function createWindow() {
   const { width: screenWidth, height: screenHeight } = screen.getPrimaryDisplay().size;
 
   win = new BrowserWindow({
-    width: 380,
-    height: 800,
-    x: screenWidth - 400,
-    y: screenHeight - 840,
+    width: 500,
+    height: 765,
+    x: screenWidth - 520,
+    y: screenHeight - 805,
     frame: false,
     transparent: true,
     alwaysOnTop: true,
@@ -73,6 +73,12 @@ app.whenReady().then(() => {
   ipcMain.on('set-size', (_event, { width, height }) => {
     if (win) {
       win.setSize(width, height);
+    }
+  });
+
+  ipcMain.on('set-ignore-mouse', (_event, ignore) => {
+    if (win) {
+      win.setIgnoreMouseEvents(ignore, { forward: true });
     }
   });
 });

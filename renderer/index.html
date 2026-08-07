@@ -43,6 +43,31 @@
       box-shadow: 0 2px 8px rgba(0, 0, 0, 0.2);
       -webkit-app-region: no-drag;
     }
+
+    #chat-container {
+      position: absolute;
+      bottom: 16px;
+      left: 50%;
+      transform: translateX(-50%);
+      width: 82%;
+      max-width: 340px;
+      -webkit-app-region: no-drag;
+    }
+
+    #chat-input {
+      box-sizing: border-box;
+      width: 100%;
+      padding: 8px 12px;
+      border: none;
+      border-radius: 12px;
+      outline: none;
+      background: rgba(255, 255, 255, 0.9);
+      color: #333;
+      font-size: 13px;
+      font-family: Arial, sans-serif;
+      box-shadow: 0 2px 8px rgba(0, 0, 0, 0.2);
+      -webkit-app-region: no-drag;
+    }
   </style>
 
   <!--
@@ -66,6 +91,9 @@
 <body>
   <canvas id="character-canvas"></canvas>
   <div id="speech-bubble"></div>
+  <div id="chat-container">
+    <input id="chat-input" type="text" placeholder="Type a message..." autocomplete="off" />
+  </div>
 
   <script type="module" src="./renderer.js"></script>
 
