@@ -5,13 +5,13 @@ let win = null;
 let tray = null;
 
 function createWindow() {
-  const { width: screenWidth, height: screenHeight } = screen.getPrimaryDisplay().size;
+  const { width: screenWidth, height: screenHeight } = screen.getPrimaryDisplay().workAreaSize;
 
   win = new BrowserWindow({
-    width: 500,
-    height: 765,
-    x: screenWidth - 520,
-    y: screenHeight - 805,
+    width: screenWidth,
+    height: screenHeight,
+    x: 0,
+    y: 0,
     frame: false,
     transparent: true,
     alwaysOnTop: true,
@@ -69,6 +69,8 @@ app.whenReady().then(() => {
       win.setPosition(x, y);
     }
   });
+
+  ipcMain.handle('get-position', () => win?.getPosition() ?? [0, 0]);
 
   ipcMain.on('set-size', (_event, { width, height }) => {
     if (win) {

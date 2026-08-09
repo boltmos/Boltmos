@@ -3,7 +3,6 @@ import base64
 import io
 import json
 import os
-import re
 import subprocess
 from pathlib import Path
 
@@ -36,7 +35,7 @@ async def find_and_click(target: str) -> bool:
     try:
         response = await asyncio.to_thread(
             groq_client.chat.completions.create,
-            model="meta-llama/llama-4-scout-17b-16e-instruct",
+            model="qwen/qwen3.6-27b",
             messages=[
                 {
                     "role": "user",
@@ -70,6 +69,100 @@ async def find_and_click(target: str) -> bool:
     return False
 
 
+async def dismiss_chrome_profile_if_present() -> bool:
+    """Chrome sometimes opens to a 'Who's using Chrome?' profile-selection
+    screen instead of a usable browser window, which leaves every step after
+    open_app typing/clicking into a screen that isn't ready for them. Checks
+    for that screen via vision and, if present, clicks the first available
+    profile to dismiss it."""
+    if not groq_client:
+        return False
+
+    img = await take_screenshot_base64()
+
+    try:
+        response = await asyncio.to_thread(
+            groq_client.chat.completions.create,
+            model="qwen/qwen3.6-27b",
+            messages=[
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "image_url",
+                            "image_url": {"url": f"data:image/png;base64,{img}"},
+                        },
+                        {
+                            "type": "text",
+                            "text": (
+                                "Is this a Chrome 'Who's using Chrome?' profile selection "
+                                "screen, as opposed to a normal loaded browser window? If "
+                                "yes, return the screen pixel coordinates of the first "
+                                "available profile icon to click through it. Return JSON "
+                                'only: {"present": true/false, "x": number, "y": number}'
+                            ),
+                        },
+                    ],
+                }
+            ],
+            response_format={"type": "json_object"},
+        )
+        result = json.loads(response.choices[0].message.content)
+    except Exception as error:
+        print(f"dismiss_chrome_profile_if_present failed: {error}")
+        return False
+
+    if not result.get("present"):
+        return False
+
+    pyautogui.click(result["x"], result["y"])
+    await asyncio.sleep(1.0)
+    return True
+
+
+EXTRACTED_RESULTS_PLACEHOLDER = "{{extracted_results}}"
+
+
+async def extract_search_results_text() -> str:
+    """Read whatever search results are currently on screen via the vision
+    model and return their text content as a plain string (not JSON) - the
+    caller (execute_steps) stashes this so a later 'type' step can use it."""
+    if not groq_client:
+        return ""
+
+    img = await take_screenshot_base64()
+
+    try:
+        response = await asyncio.to_thread(
+            groq_client.chat.completions.create,
+            model="qwen/qwen3.6-27b",
+            messages=[
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "image_url",
+                            "image_url": {"url": f"data:image/png;base64,{img}"},
+                        },
+                        {
+                            "type": "text",
+                            "text": (
+                                "Read the visible search results on this screen and extract "
+                                "their text content (titles, snippets, URLs) as plain text, "
+                                "one result per line. Return only the extracted text, no "
+                                "commentary or formatting."
+                            ),
+                        },
+                    ],
+                }
+            ],
+        )
+        return response.choices[0].message.content.strip()
+    except Exception as error:
+        print(f"extract_search_results_text failed: {error}")
+        return ""
+
+
 load_dotenv(Path(__file__).resolve().parent.parent / ".env")
 
 app = FastAPI()
@@ -91,9 +184,22 @@ KNOWN_APPS = {
 }
 
 
+def match_fast_path_app(task: str) -> str | None:
+    """Recognizes a bare 'open <app>' request with nothing else in it, e.g.
+    'open notepad' or 'open chrome' - anything more (extra words, multiple
+    apps, searches, typing) means the candidate after stripping 'open ' won't
+    exactly equal a KNOWN_APPS key, so it falls through to the full Groq
+    planner/vision pipeline instead."""
+    normalized = task.strip().lower()
+    if not normalized.startswith("open "):
+        return None
+    candidate = normalized[len("open "):].strip()
+    return candidate if candidate in KNOWN_APPS else None
+
+
 GROQ_MODEL = "llama-3.3-70b-versatile"
 
-MAX_STEPS = 4
+MAX_STEPS = 5
 
 SYSTEM_PROMPT = """You convert user tasks into Windows PC steps.
 You are controlling a real Windows PC.
@@ -104,7 +210,7 @@ Only generate steps that are explicitly and literally requested in the user
 task, never assume additional steps, never add bonus actions, never open
 unrelated apps or websites. If the user says open chrome, the only step is
 opening chrome.
-Maximum of 4 steps total, no exceptions.
+Maximum of 5 steps total, no exceptions.
 
 Available actions:
 - open_app: opens application. value = app name.
@@ -121,7 +227,11 @@ Available actions:
 - click_target: finds and clicks something visible on screen.
   value = description of element like "YouTube search bar" or "profile icon".
   Use this instead of blind typing when possible.
-- type: types text. value = text
+- extract_search_results: reads the search results currently on screen via
+  vision and captures their text. value not needed. Only use right after a
+  search (search_google/search_youtube/navigate) has finished loading.
+- type: types text. value = text. To type whatever extract_search_results
+  just captured, use value: "{{extracted_results}}" instead of literal text.
 - press: presses key. value = key name
 - hotkey: keyboard shortcut. value = "ctrl+t" etc
 - wait: waits. value = seconds as string
@@ -135,6 +245,12 @@ CRITICAL RULES:
    Step 1: open_app chrome (wait: 0.5)
    Step 2: navigate to youtube.com (wait: 3.0)
    Step 3: search_youtube for X (wait: 3.5)
+6. For "open chrome, search for best yc startups, and write the results in notepad":
+   Step 1: open_app chrome (wait: 0.5)
+   Step 2: search_google "best yc startups" (wait: 3.0)
+   Step 3: extract_search_results (wait: 1.0)
+   Step 4: open_app notepad (wait: 0.5)
+   Step 5: type "{{extracted_results}}" (wait: 3.5)
 
 Return JSON:
 {
@@ -168,11 +284,14 @@ except Exception as error:
     print(f"Warning: Kokoro TTS failed to load, voice output disabled: {error}")
 
 
-async def speak_text(text: str) -> None:
-    """Generate speech audio for text with Kokoro and push it to the frontend
-    over the websocket as base64-encoded WAV, action speak_audio."""
+async def speak_text(text: str, emotion: str) -> str:
+    """Generate speech audio for text with Kokoro's af_heart voice and return
+    it as a base64-encoded WAV string ("" if Kokoro isn't available or text is
+    empty). emotion isn't fed into generation yet - af_heart has no per-call
+    prosody control - it's accepted now so callers/logging have it on hand
+    for whenever emotion-driven voice tuning is added."""
     if not kokoro_pipeline or not text:
-        return
+        return ""
 
     def generate_audio_b64() -> str:
         chunks = [audio for _, _, audio in kokoro_pipeline(text, voice=KOKORO_VOICE)]
@@ -183,12 +302,10 @@ async def speak_text(text: str) -> None:
         return base64.b64encode(buffer.read()).decode()
 
     try:
-        audio_b64 = await asyncio.to_thread(generate_audio_b64)
+        return await asyncio.to_thread(generate_audio_b64)
     except Exception as error:
         print(f"speak_text failed: {error}")
-        return
-
-    await send_to_lyra_raw({"action": "speak_audio", "audio": audio_b64})
+        return ""
 
 
 async def plan_steps(task: str) -> dict:
@@ -227,19 +344,20 @@ async def plan_steps(task: str) -> dict:
         return {"steps": fallback_steps, "summary": ""}
 
 
-def step_matches_task(step: dict, task: str) -> bool:
-    """Simple keyword match: the step's action/value must share at least one
-    word with the user's task text, or it's considered unrelated and skipped."""
-    task_words = [word for word in re.findall(r"[a-z0-9]+", task.lower()) if len(word) >= 2]
-    if not task_words:
-        return True
-
+def is_step_safe(step: dict) -> bool:
+    """Lightweight safety net, not a relevance filter: blocks a step only if
+    it matches an explicitly dangerous pattern (destructive actions,
+    credentials, or system file paths). Otherwise trusts the planning
+    model's step selection - it already has full context of the user's
+    intent, unlike a naive keyword-overlap check against the raw task text."""
     step_text = f"{step.get('action', '')} {step.get('value', '')}".lower()
+    dangerous_patterns = DANGEROUS_WORDS + ["system32", "\\windows\\", "regedit", "registry"]
+    return not any(pattern in step_text for pattern in dangerous_patterns)
 
-    return any(word in step_text for word in task_words)
 
+async def execute_steps(steps: list, websocket_send):
+    last_extracted_text = ""
 
-async def execute_steps(steps: list, websocket_send, task: str):
     for index, step in enumerate(steps, start=1):
         if not isinstance(step, dict):
             print(f"STEP {index}/{len(steps)}: {step!r} action=None value=None validation=FAILED (not a dict)")
@@ -247,15 +365,15 @@ async def execute_steps(steps: list, websocket_send, task: str):
 
         action = step.get("action")
         value = step.get("value", "")
-        passed_validation = step_matches_task(step, task)
+        is_safe = is_step_safe(step)
 
         print(
             f"STEP {index}/{len(steps)}: action={action!r} value={value!r} "
-            f"validation={'PASSED' if passed_validation else 'FAILED'}"
+            f"safety_check={'PASSED' if is_safe else 'BLOCKED'}"
         )
 
-        if not passed_validation:
-            print(f"SKIPPED step {index} as unrelated to user task {task!r}: {step}")
+        if not is_safe:
+            print(f"BLOCKED step {index} as dangerous: {step}")
             continue
 
         message = step.get("message", "")
@@ -281,7 +399,7 @@ async def execute_steps(steps: list, websocket_send, task: str):
                         subprocess.Popen(app_path)
                         opened = True
                         # Wait longer for app to fully open
-                        await asyncio.sleep(3.0)
+                        await asyncio.sleep(1.8)
                         break
             if not opened:
                 pyautogui.hotkey("win", "s")
@@ -289,7 +407,10 @@ async def execute_steps(steps: list, websocket_send, task: str):
                 pyautogui.write(value, interval=0.05)
                 await asyncio.sleep(0.8)
                 pyautogui.press("enter")
-                await asyncio.sleep(3.0)
+                await asyncio.sleep(1.8)
+
+            if "chrome" in app_lower:
+                await dismiss_chrome_profile_if_present()
 
         elif action == "new_tab":
             pyautogui.hotkey("ctrl", "t")
@@ -305,7 +426,7 @@ async def execute_steps(steps: list, websocket_send, task: str):
             await asyncio.sleep(0.3)
             pyautogui.press("enter")
             # Wait for page to load
-            await asyncio.sleep(3.5)
+            await asyncio.sleep(2.0)
 
         elif action == "search_youtube":
             # Press / which focuses YouTube's search bar
@@ -321,10 +442,11 @@ async def execute_steps(steps: list, websocket_send, task: str):
             await asyncio.sleep(0.3)
             pyautogui.write(f"https://www.google.com/search?q={value}", interval=0.03)
             pyautogui.press("enter")
-            await asyncio.sleep(2.0)
+            await asyncio.sleep(1.5)
 
         elif action == "type":
-            pyautogui.write(value, interval=0.05)
+            text_to_type = last_extracted_text if value == EXTRACTED_RESULTS_PLACEHOLDER else value
+            pyautogui.write(text_to_type, interval=0.05)
             await asyncio.sleep(0.5)
 
         elif action == "press":
@@ -347,6 +469,15 @@ async def execute_steps(steps: list, websocket_send, task: str):
             if not found:
                 await websocket_send({"action": "speak", "text": f"I couldn't find {value} on screen"})
                 await asyncio.sleep(1.0)
+
+        elif action == "extract_search_results":
+            last_extracted_text = await extract_search_results_text()
+            if not last_extracted_text:
+                await websocket_send({"action": "speak", "text": "I couldn't read the search results"})
+                await asyncio.sleep(0.6)
+
+        elif action == "dismiss_chrome_profile_if_present":
+            await dismiss_chrome_profile_if_present()
 
 
 connected_clients = set()
@@ -377,43 +508,80 @@ async def send_to_lyra_raw(message: dict):
 
 async def send_to_lyra(message: dict):
     """Broadcast a message to the frontend, and whenever it's a speak or
-    task_done message carrying text, also generate and push voice audio."""
-    await send_to_lyra_raw(message)
-
+    task_done message carrying text, attach base64 Kokoro audio for it under
+    the "audio" field before sending (the /chat endpoint generates and
+    attaches its own audio directly instead of going through here, so it
+    isn't double-generated)."""
     if message.get("action") in ("speak", "task_done") and message.get("text"):
-        await speak_text(message["text"])
+        audio_b64 = await speak_text(message["text"], message.get("emotion", "neutral"))
+        if audio_b64:
+            message = {**message, "audio": audio_b64}
+
+    await send_to_lyra_raw(message)
 
 
 DANGEROUS_WORDS = ["password", "bank", "payment", "credit card", "delete", "format"]
 
 CHAT_SYSTEM_PROMPT = """You are Lyra, a friendly AI companion. Respond naturally
 and conversationally to whatever the user says, including general questions.
-Keep responses under 3 sentences unless asked for detail."""
+Keep responses under 3 sentences unless asked for detail.
+
+Always respond with a JSON object with exactly two fields:
+- "text": your conversational reply, as plain text.
+- "emotion": exactly one of "happy", "angry", "sad", "relaxed", "surprised", or
+  "neutral" - whichever best matches the emotional tone of your reply itself.
+
+Example: {"text": "That's wonderful, I'm so glad it worked out!", "emotion": "happy"}"""
+
+VALID_CHAT_EMOTIONS = {"happy", "angry", "sad", "relaxed", "surprised", "neutral"}
+
+
+task_lock = asyncio.Lock()
 
 
 @app.post("/task")
 async def handle_task(body: dict):
-    task = body.get("task", "")
+    # PyAutoGUI drives the one real mouse/keyboard on the machine, so two
+    # tasks can never safely run at once - reject immediately rather than
+    # queuing, since a queued task would otherwise fire unattended
+    # automation later with no way for the user to know it's about to start.
+    if task_lock.locked():
+        return {"success": False, "reason": "busy", "message": "A task is already in progress"}
 
-    if any(word in task.lower() for word in DANGEROUS_WORDS):
-        await send_to_lyra({"action": "speak", "text": "I cannot do that safely"})
-        return {"success": False, "reason": "blocked"}
+    async with task_lock:
+        task = body.get("task", "")
 
-    await send_to_lyra({"action": "thinking", "text": "let me figure that out..."})
+        if any(word in task.lower() for word in DANGEROUS_WORDS):
+            await send_to_lyra({"action": "speak", "text": "I cannot do that safely"})
+            return {"success": False, "reason": "blocked"}
 
-    plan = await plan_steps(task)
-    steps = plan["steps"][:MAX_STEPS]
-    summary = plan["summary"]
+        fast_path_app = match_fast_path_app(task)
+        if fast_path_app:
+            app_path = KNOWN_APPS[fast_path_app]
+            if os.path.exists(app_path):
+                subprocess.Popen(app_path)
+                await asyncio.sleep(0.5)
+                await send_to_lyra({"action": "task_done", "text": f"opened {fast_path_app}! ✨"})
+                return {"success": True, "steps": 1}
+            # Path doesn't actually exist on this machine - fall through to
+            # the full pipeline below, which has its own not-found handling
+            # (win+s search) in execute_steps.
 
-    if summary:
-        await send_to_lyra({"action": "speak", "text": summary})
-        await asyncio.sleep(1.5)
+        await send_to_lyra({"action": "thinking", "text": "let me figure that out..."})
 
-    await execute_steps(steps, send_to_lyra, task)
+        plan = await plan_steps(task)
+        steps = plan["steps"][:MAX_STEPS]
+        summary = plan["summary"]
 
-    await send_to_lyra({"action": "task_done", "text": "all done! ✨"})
+        if summary:
+            await send_to_lyra({"action": "speak", "text": summary})
+            await asyncio.sleep(1.5)
 
-    return {"success": True, "steps": len(steps)}
+        await execute_steps(steps, send_to_lyra)
+
+        await send_to_lyra({"action": "task_done", "text": "all done! ✨"})
+
+        return {"success": True, "steps": len(steps)}
 
 
 @app.post("/chat")
@@ -428,6 +596,7 @@ async def handle_chat(body: dict):
 
     if not groq_client:
         reply_text = "I can't chat right now, my brain (Groq) isn't connected."
+        emotion = "neutral"
     else:
         try:
             response = await asyncio.to_thread(
@@ -437,15 +606,27 @@ async def handle_chat(body: dict):
                     {"role": "system", "content": CHAT_SYSTEM_PROMPT},
                     {"role": "user", "content": message},
                 ],
+                response_format={"type": "json_object"},
             )
-            reply_text = response.choices[0].message.content.strip()
+            result = json.loads(response.choices[0].message.content)
+            reply_text = (result.get("text") or "").strip()
+            emotion = result.get("emotion")
+            if emotion not in VALID_CHAT_EMOTIONS:
+                emotion = "neutral"
+            if not reply_text:
+                reply_text = "Sorry, I couldn't think of a reply just now."
         except Exception as error:
             print(f"Groq chat call failed: {error}")
             reply_text = "Sorry, I couldn't think of a reply just now."
+            emotion = "neutral"
 
-    await send_to_lyra({"action": "speak", "text": reply_text})
+    audio_b64 = await speak_text(reply_text, emotion)
 
-    return {"success": True, "text": reply_text}
+    await send_to_lyra_raw(
+        {"action": "speak", "text": reply_text, "emotion": emotion, "audio": audio_b64}
+    )
+
+    return {"success": True, "text": reply_text, "emotion": emotion}
 
 
 async def main():
