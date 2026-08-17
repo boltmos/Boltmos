@@ -2,8 +2,10 @@ import asyncio
 import base64
 import io
 import json
+import logging
 import os
 import subprocess
+from logging.handlers import RotatingFileHandler
 from pathlib import Path
 
 import numpy as np
@@ -165,6 +167,17 @@ async def extract_search_results_text() -> str:
 
 load_dotenv(Path(__file__).resolve().parent.parent / ".env")
 
+LOG_DIR = Path(__file__).resolve().parent / "logs"
+LOG_DIR.mkdir(exist_ok=True)
+
+task_logger = logging.getLogger("boltmos.tasks")
+task_logger.setLevel(logging.INFO)
+_log_handler = RotatingFileHandler(
+    LOG_DIR / "backend.log", maxBytes=1_000_000, backupCount=3
+)
+_log_handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
+task_logger.addHandler(_log_handler)
+
 app = FastAPI()
 
 app.add_middleware(
@@ -177,6 +190,8 @@ app.add_middleware(
 KNOWN_APPS = {
     "chrome": r"C:\Program Files\Google\Chrome\Application\chrome.exe",
     "google chrome": r"C:\Program Files\Google\Chrome\Application\chrome.exe",
+    "edge": r"C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe",
+    "microsoft edge": r"C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe",
     "notepad": r"C:\Windows\System32\notepad.exe",
     "calculator": r"C:\Windows\System32\calc.exe",
     "spotify": os.path.expanduser(r"~\AppData\Roaming\Spotify\Spotify.exe"),
@@ -197,7 +212,7 @@ def match_fast_path_app(task: str) -> str | None:
     return candidate if candidate in KNOWN_APPS else None
 
 
-GROQ_MODEL = "llama-3.3-70b-versatile"
+GROQ_MODEL = "openai/gpt-oss-120b"
 
 MAX_STEPS = 5
 
@@ -214,6 +229,7 @@ Maximum of 5 steps total, no exceptions.
 
 Available actions:
 - open_app: opens application. value = app name.
+  Known apps: chrome, edge, notepad, calculator, spotify, file explorer.
   ALWAYS add wait: 3.0 for this step
 - navigate: types URL in browser address bar then presses enter.
   value = full url like "youtube.com".
@@ -276,6 +292,12 @@ if not groq_client:
 
 KOKORO_VOICE = "af_heart"
 KOKORO_SAMPLE_RATE = 24000
+# 1.0 is Kokoro's default pace for this voice pack - reads slightly slow/flat
+# for back-and-forth chat. Nudged up for a snappier conversational cadence;
+# Kokoro's own model card treats roughly 0.8-1.3 as the safe range before
+# articulation starts to degrade, so this has headroom either direction if it
+# needs retuning by ear.
+KOKORO_SPEED = 1.1
 
 try:
     kokoro_pipeline = KPipeline(lang_code="a")
@@ -285,16 +307,21 @@ except Exception as error:
 
 
 async def speak_text(text: str, emotion: str) -> str:
-    """Generate speech audio for text with Kokoro's af_heart voice and return
-    it as a base64-encoded WAV string ("" if Kokoro isn't available or text is
-    empty). emotion isn't fed into generation yet - af_heart has no per-call
-    prosody control - it's accepted now so callers/logging have it on hand
-    for whenever emotion-driven voice tuning is added."""
+    """Generate speech audio for text with Kokoro's af_heart voice at
+    KOKORO_SPEED and return it as a base64-encoded WAV string ("" if Kokoro
+    isn't available or text is empty). emotion isn't fed into generation yet
+    - speed is currently the only per-call prosody control Kokoro exposes,
+    and it's fixed rather than emotion-driven - the param is accepted now so
+    callers/logging have it on hand for whenever emotion-driven voice tuning
+    (e.g. per-emotion speed) is added."""
     if not kokoro_pipeline or not text:
         return ""
 
     def generate_audio_b64() -> str:
-        chunks = [audio for _, _, audio in kokoro_pipeline(text, voice=KOKORO_VOICE)]
+        chunks = [
+            audio
+            for _, _, audio in kokoro_pipeline(text, voice=KOKORO_VOICE, speed=KOKORO_SPEED)
+        ]
         full_audio = np.concatenate(chunks) if len(chunks) > 1 else chunks[0]
         buffer = io.BytesIO()
         sf.write(buffer, full_audio, KOKORO_SAMPLE_RATE, format="WAV")
@@ -338,9 +365,13 @@ async def plan_steps(task: str) -> dict:
             print(f"Groq returned {len(steps)} steps, truncating to MAX_STEPS={MAX_STEPS}")
             steps = steps[:MAX_STEPS]
 
+        task_logger.info(
+            f"PLAN for task {task!r}: {json.dumps({'steps': steps, 'summary': summary})}"
+        )
         return {"steps": steps, "summary": summary}
     except Exception as error:
         print(f"Groq planning call failed: {error}")
+        task_logger.error(f"PLAN FAILED for task {task!r}: {error}")
         return {"steps": fallback_steps, "summary": ""}
 
 
@@ -361,6 +392,7 @@ async def execute_steps(steps: list, websocket_send):
     for index, step in enumerate(steps, start=1):
         if not isinstance(step, dict):
             print(f"STEP {index}/{len(steps)}: {step!r} action=None value=None validation=FAILED (not a dict)")
+            task_logger.error(f"STEP {index}/{len(steps)} step={step!r} -> FAILED: not a dict")
             continue
 
         action = step.get("action")
@@ -374,6 +406,7 @@ async def execute_steps(steps: list, websocket_send):
 
         if not is_safe:
             print(f"BLOCKED step {index} as dangerous: {step}")
+            task_logger.warning(f"STEP {index}/{len(steps)} action={action!r} value={value!r} -> BLOCKED (unsafe)")
             continue
 
         message = step.get("message", "")
@@ -390,94 +423,108 @@ async def execute_steps(steps: list, websocket_send):
             await websocket_send({"action": "speak", "text": message})
             await asyncio.sleep(0.5)
 
-        if action == "open_app":
-            app_lower = value.lower().strip()
-            opened = False
-            for app_name, app_path in KNOWN_APPS.items():
-                if app_name in app_lower:
-                    if os.path.exists(app_path):
-                        subprocess.Popen(app_path)
-                        opened = True
-                        # Wait longer for app to fully open
-                        await asyncio.sleep(1.8)
-                        break
-            if not opened:
-                pyautogui.hotkey("win", "s")
-                await asyncio.sleep(1.0)
-                pyautogui.write(value, interval=0.05)
-                await asyncio.sleep(0.8)
-                pyautogui.press("enter")
-                await asyncio.sleep(1.8)
+        step_outcome = "SUCCESS"
 
-            if "chrome" in app_lower:
+        try:
+            if action == "open_app":
+                app_lower = value.lower().strip()
+                opened = False
+                for app_name, app_path in KNOWN_APPS.items():
+                    if app_name in app_lower:
+                        if os.path.exists(app_path):
+                            subprocess.Popen(app_path)
+                            opened = True
+                            # Wait longer for app to fully open
+                            await asyncio.sleep(1.8)
+                            break
+                if not opened:
+                    pyautogui.hotkey("win", "s")
+                    await asyncio.sleep(1.0)
+                    pyautogui.write(value, interval=0.05)
+                    await asyncio.sleep(0.8)
+                    pyautogui.press("enter")
+                    await asyncio.sleep(1.8)
+
+                if "chrome" in app_lower:
+                    await dismiss_chrome_profile_if_present()
+
+            elif action == "new_tab":
+                pyautogui.hotkey("ctrl", "t")
+                await asyncio.sleep(1.0)
+
+            elif action == "navigate":
+                # Click address bar first then type URL
+                pyautogui.hotkey("ctrl", "l")
+                await asyncio.sleep(0.5)
+                pyautogui.hotkey("ctrl", "a")
+                await asyncio.sleep(0.2)
+                pyautogui.write(value, interval=0.04)
+                await asyncio.sleep(0.3)
+                pyautogui.press("enter")
+                # Wait for page to load
+                await asyncio.sleep(2.0)
+
+            elif action == "search_youtube":
+                # Press / which focuses YouTube's search bar
+                pyautogui.press("/")
+                await asyncio.sleep(0.5)
+                pyautogui.write(value, interval=0.04)
+                await asyncio.sleep(0.3)
+                pyautogui.press("enter")
+                await asyncio.sleep(2.0)
+
+            elif action == "search_google":
+                pyautogui.hotkey("ctrl", "l")
+                await asyncio.sleep(0.3)
+                pyautogui.write(f"https://www.google.com/search?q={value}", interval=0.03)
+                pyautogui.press("enter")
+                await asyncio.sleep(1.5)
+
+            elif action == "type":
+                text_to_type = last_extracted_text if value == EXTRACTED_RESULTS_PLACEHOLDER else value
+                pyautogui.write(text_to_type, interval=0.05)
+                await asyncio.sleep(0.5)
+
+            elif action == "press":
+                pyautogui.press(value)
+                await asyncio.sleep(0.3)
+
+            elif action == "hotkey":
+                keys = value.split("+")
+                pyautogui.hotkey(*keys)
+                await asyncio.sleep(0.5)
+
+            elif action == "wait":
+                try:
+                    await asyncio.sleep(float(value))
+                except (TypeError, ValueError):
+                    pass
+
+            elif action == "click_target":
+                found = await find_and_click(value)
+                if not found:
+                    await websocket_send({"action": "speak", "text": f"I couldn't find {value} on screen"})
+                    await asyncio.sleep(1.0)
+                    step_outcome = "FAILED: target not found on screen"
+
+            elif action == "extract_search_results":
+                last_extracted_text = await extract_search_results_text()
+                if not last_extracted_text:
+                    await websocket_send({"action": "speak", "text": "I couldn't read the search results"})
+                    await asyncio.sleep(0.6)
+                    step_outcome = "FAILED: could not read search results"
+
+            elif action == "dismiss_chrome_profile_if_present":
                 await dismiss_chrome_profile_if_present()
 
-        elif action == "new_tab":
-            pyautogui.hotkey("ctrl", "t")
-            await asyncio.sleep(1.0)
+            else:
+                step_outcome = "FAILED: unknown action"
+        except Exception as error:
+            step_outcome = f"FAILED: {error}"
 
-        elif action == "navigate":
-            # Click address bar first then type URL
-            pyautogui.hotkey("ctrl", "l")
-            await asyncio.sleep(0.5)
-            pyautogui.hotkey("ctrl", "a")
-            await asyncio.sleep(0.2)
-            pyautogui.write(value, interval=0.04)
-            await asyncio.sleep(0.3)
-            pyautogui.press("enter")
-            # Wait for page to load
-            await asyncio.sleep(2.0)
-
-        elif action == "search_youtube":
-            # Press / which focuses YouTube's search bar
-            pyautogui.press("/")
-            await asyncio.sleep(0.5)
-            pyautogui.write(value, interval=0.04)
-            await asyncio.sleep(0.3)
-            pyautogui.press("enter")
-            await asyncio.sleep(2.0)
-
-        elif action == "search_google":
-            pyautogui.hotkey("ctrl", "l")
-            await asyncio.sleep(0.3)
-            pyautogui.write(f"https://www.google.com/search?q={value}", interval=0.03)
-            pyautogui.press("enter")
-            await asyncio.sleep(1.5)
-
-        elif action == "type":
-            text_to_type = last_extracted_text if value == EXTRACTED_RESULTS_PLACEHOLDER else value
-            pyautogui.write(text_to_type, interval=0.05)
-            await asyncio.sleep(0.5)
-
-        elif action == "press":
-            pyautogui.press(value)
-            await asyncio.sleep(0.3)
-
-        elif action == "hotkey":
-            keys = value.split("+")
-            pyautogui.hotkey(*keys)
-            await asyncio.sleep(0.5)
-
-        elif action == "wait":
-            try:
-                await asyncio.sleep(float(value))
-            except (TypeError, ValueError):
-                pass
-
-        elif action == "click_target":
-            found = await find_and_click(value)
-            if not found:
-                await websocket_send({"action": "speak", "text": f"I couldn't find {value} on screen"})
-                await asyncio.sleep(1.0)
-
-        elif action == "extract_search_results":
-            last_extracted_text = await extract_search_results_text()
-            if not last_extracted_text:
-                await websocket_send({"action": "speak", "text": "I couldn't read the search results"})
-                await asyncio.sleep(0.6)
-
-        elif action == "dismiss_chrome_profile_if_present":
-            await dismiss_chrome_profile_if_present()
+        task_logger.info(
+            f"STEP {index}/{len(steps)} action={action!r} value={value!r} -> {step_outcome}"
+        )
 
 
 connected_clients = set()
@@ -550,6 +597,7 @@ async def handle_task(body: dict):
 
     async with task_lock:
         task = body.get("task", "")
+        task_logger.info(f"TASK RECEIVED: {task!r}")
 
         if any(word in task.lower() for word in DANGEROUS_WORDS):
             await send_to_lyra({"action": "speak", "text": "I cannot do that safely"})
