@@ -19,6 +19,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from groq import Groq
 from kokoro import KPipeline
 from PIL import ImageGrab
+from supabase import create_client, Client
 
 
 async def take_screenshot_base64() -> str:
@@ -230,15 +231,18 @@ Maximum of 5 steps total, no exceptions.
 Available actions:
 - open_app: opens application. value = app name.
   Known apps: chrome, edge, notepad, calculator, spotify, file explorer.
-  ALWAYS add wait: 3.0 for this step
+  Use wait: 0.3-0.5 for this step. These are minimums, not comfortable
+  defaults - do not pad them higher "to be safe".
 - navigate: types URL in browser address bar then presses enter.
   value = full url like "youtube.com".
   ALWAYS add wait: 1.0 before and expect 3 seconds to load
 - search_youtube: searches on YouTube using / shortcut.
   value = search query. Only use when YouTube is already open.
-  ALWAYS add wait: 3.0 before this step
+  Use wait: 0.5-0.8 before this step. These are minimums, not comfortable
+  defaults - do not pad them higher "to be safe".
 - search_google: searches Google directly.
-  value = search query
+  value = search query. Use wait: 0.5-0.8 before this step. These are
+  minimums, not comfortable defaults - do not pad them higher "to be safe".
 - new_tab: opens new browser tab
 - click_target: finds and clicks something visible on screen.
   value = description of element like "YouTube search bar" or "profile icon".
@@ -258,25 +262,25 @@ CRITICAL RULES:
 3. search_youtube only works after YouTube is fully loaded
 4. Always add enough wait time between steps
 5. For "open chrome and search youtube for X":
-   Step 1: open_app chrome (wait: 0.5)
+   Step 1: open_app chrome (wait: 0.4)
    Step 2: navigate to youtube.com (wait: 3.0)
-   Step 3: search_youtube for X (wait: 3.5)
+   Step 3: search_youtube for X (wait: 0.6)
 6. For "open chrome, search for best yc startups, and write the results in notepad":
-   Step 1: open_app chrome (wait: 0.5)
-   Step 2: search_google "best yc startups" (wait: 3.0)
+   Step 1: open_app chrome (wait: 0.4)
+   Step 2: search_google "best yc startups" (wait: 0.6)
    Step 3: extract_search_results (wait: 1.0)
-   Step 4: open_app notepad (wait: 0.5)
+   Step 4: open_app notepad (wait: 0.4)
    Step 5: type "{{extracted_results}}" (wait: 3.5)
 
 Return JSON:
 {
   "steps": [
     {"action": "open_app", "value": "chrome",
-     "wait": 0.5, "message": "opening chrome!"},
+     "wait": 0.4, "message": "opening chrome!"},
     {"action": "navigate", "value": "youtube.com",
      "wait": 3.0, "message": "going to youtube!"},
     {"action": "search_youtube", "value": "AI tutorials",
-     "wait": 3.5, "message": "searching for that!"}
+     "wait": 0.6, "message": "searching for that!"}
   ],
   "summary": "I'll open Chrome, go to YouTube and search for AI tutorials"
 }"""
@@ -289,6 +293,24 @@ groq_client = Groq(api_key=groq_api_key) if groq_api_key else None
 
 if not groq_client:
     print("Warning: GROQ_API_KEYS is missing or empty in .env. Tasks will run as a single step.")
+
+supabase_url = os.getenv("SUPABASE_URL")
+supabase_key = os.getenv("SUPABASE_KEY")
+supabase_client: Client | None = (
+    create_client(supabase_url, supabase_key) if supabase_url and supabase_key else None
+)
+
+if not supabase_client:
+    print("Warning: SUPABASE_URL or SUPABASE_KEY is missing in .env. Persistent memory is disabled.")
+else:
+    try:
+        supabase_client.table("conversation_history").select("id").limit(1).execute()
+        print("Supabase connected: conversation_history table reachable.")
+    except Exception as error:
+        print(f"Supabase connection test failed: {error}")
+
+# Placeholder until real user accounts exist - all chat history logs under this one user_id.
+TEST_USER_ID = "00000000-0000-0000-0000-000000000001"
 
 KOKORO_VOICE = "af_heart"
 KOKORO_SAMPLE_RATE = 24000
@@ -421,7 +443,7 @@ async def execute_steps(steps: list, websocket_send):
 
         if message:
             await websocket_send({"action": "speak", "text": message})
-            await asyncio.sleep(0.5)
+            await asyncio.sleep(0.2)
 
         step_outcome = "SUCCESS"
 
@@ -435,7 +457,7 @@ async def execute_steps(steps: list, websocket_send):
                             subprocess.Popen(app_path)
                             opened = True
                             # Wait longer for app to fully open
-                            await asyncio.sleep(1.8)
+                            await asyncio.sleep(0.5)
                             break
                 if not opened:
                     pyautogui.hotkey("win", "s")
@@ -455,14 +477,14 @@ async def execute_steps(steps: list, websocket_send):
             elif action == "navigate":
                 # Click address bar first then type URL
                 pyautogui.hotkey("ctrl", "l")
-                await asyncio.sleep(0.5)
+                await asyncio.sleep(0.1)
                 pyautogui.hotkey("ctrl", "a")
-                await asyncio.sleep(0.2)
+                await asyncio.sleep(0.1)
                 pyautogui.write(value, interval=0.04)
-                await asyncio.sleep(0.3)
+                await asyncio.sleep(0.1)
                 pyautogui.press("enter")
                 # Wait for page to load
-                await asyncio.sleep(2.0)
+                await asyncio.sleep(0.5)
 
             elif action == "search_youtube":
                 # Press / which focuses YouTube's search bar
@@ -471,14 +493,14 @@ async def execute_steps(steps: list, websocket_send):
                 pyautogui.write(value, interval=0.04)
                 await asyncio.sleep(0.3)
                 pyautogui.press("enter")
-                await asyncio.sleep(2.0)
+                await asyncio.sleep(0.4)
 
             elif action == "search_google":
                 pyautogui.hotkey("ctrl", "l")
                 await asyncio.sleep(0.3)
                 pyautogui.write(f"https://www.google.com/search?q={value}", interval=0.03)
                 pyautogui.press("enter")
-                await asyncio.sleep(1.5)
+                await asyncio.sleep(0.3)
 
             elif action == "type":
                 text_to_type = last_extracted_text if value == EXTRACTED_RESULTS_PLACEHOLDER else value
@@ -642,6 +664,24 @@ async def handle_chat(body: dict):
         await send_to_lyra({"action": "speak", "text": "I cannot do that safely"})
         return {"success": False, "reason": "blocked"}
 
+    history_messages = []
+    if supabase_client:
+        try:
+            history_response = await asyncio.to_thread(
+                supabase_client.table("conversation_history")
+                .select("role, message")
+                .eq("user_id", TEST_USER_ID)
+                .order("created_at", desc=True)
+                .limit(10)
+                .execute
+            )
+            history_messages = [
+                {"role": row["role"], "content": row["message"]}
+                for row in reversed(history_response.data)
+            ]
+        except Exception as error:
+            print(f"Supabase conversation_history fetch failed: {error}")
+
     if not groq_client:
         reply_text = "I can't chat right now, my brain (Groq) isn't connected."
         emotion = "neutral"
@@ -652,6 +692,7 @@ async def handle_chat(body: dict):
                 model=GROQ_MODEL,
                 messages=[
                     {"role": "system", "content": CHAT_SYSTEM_PROMPT},
+                    *history_messages,
                     {"role": "user", "content": message},
                 ],
                 response_format={"type": "json_object"},
@@ -673,6 +714,26 @@ async def handle_chat(body: dict):
     await send_to_lyra_raw(
         {"action": "speak", "text": reply_text, "emotion": emotion, "audio": audio_b64}
     )
+
+    if supabase_client:
+        try:
+            await asyncio.to_thread(
+                supabase_client.table("conversation_history")
+                .insert(
+                    [
+                        {"user_id": TEST_USER_ID, "role": "user", "message": message},
+                        {
+                            "user_id": TEST_USER_ID,
+                            "role": "assistant",
+                            "message": reply_text,
+                            "emotion": emotion,
+                        },
+                    ]
+                )
+                .execute
+            )
+        except Exception as error:
+            print(f"Supabase conversation_history insert failed: {error}")
 
     return {"success": True, "text": reply_text, "emotion": emotion}
 
