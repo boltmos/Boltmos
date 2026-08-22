@@ -29,6 +29,10 @@
     #speech-bubble {
       display: none;
       position: absolute;
+      /* top is set dynamically in renderer.js (positionSpeechBubble()),
+         tracked to the character's actual projected head position each
+         frame - see the identical rationale on #chat-container above. This
+         is a fallback only, used before the first camera frame has run. */
       top: 12px;
       left: 50%;
       transform: translateX(-50%);
@@ -45,16 +49,230 @@
     }
 
     #chat-container {
+      display: none;
       position: absolute;
-      bottom: 16px;
+      /* top is set dynamically in renderer.js (positionChatContainer()),
+         tracked to the character's actual projected feet position each
+         frame - the window is desktop-sized, so a fixed offset can't stay
+         near her regardless of her height/zoom/framing. This is a fallback
+         only, used before the first camera frame has run. */
+      top: 50%;
       left: 50%;
       transform: translateX(-50%);
       width: 82%;
       max-width: 340px;
-      display: flex;
       align-items: center;
       gap: 8px;
       -webkit-app-region: no-drag;
+    }
+
+    #onboarding-overlay {
+      display: none;
+      position: absolute;
+      top: 50%;
+      left: 50%;
+      transform: translate(-50%, -50%);
+      width: 84%;
+      max-width: 300px;
+      flex-direction: column;
+      gap: 10px;
+      background: rgba(255, 255, 255, 0.95);
+      padding: 18px;
+      border-radius: 14px;
+      box-shadow: 0 4px 16px rgba(0, 0, 0, 0.25);
+      font-family: Arial, sans-serif;
+      -webkit-app-region: no-drag;
+    }
+
+    #onboarding-overlay h2 {
+      margin: 0 0 4px;
+      font-size: 15px;
+      color: #333;
+      text-align: center;
+    }
+
+    #onboarding-overlay label {
+      font-size: 11px;
+      color: #555;
+      margin-bottom: 2px;
+      display: block;
+    }
+
+    #onboarding-overlay input {
+      box-sizing: border-box;
+      width: 100%;
+      padding: 8px 10px;
+      border: 1px solid #ddd;
+      border-radius: 8px;
+      outline: none;
+      font-size: 13px;
+      color: #333;
+      -webkit-app-region: no-drag;
+    }
+
+    #onboarding-overlay button {
+      margin-top: 4px;
+      padding: 9px;
+      border: none;
+      border-radius: 8px;
+      background: #6c5ce7;
+      color: white;
+      font-size: 13px;
+      font-weight: bold;
+      cursor: pointer;
+      -webkit-app-region: no-drag;
+    }
+
+    #onboarding-overlay button:disabled {
+      opacity: 0.6;
+      cursor: default;
+    }
+
+    #onboarding-error {
+      display: none;
+      font-size: 11px;
+      color: #e53935;
+      text-align: center;
+    }
+
+    #chat-toolbar {
+      display: none;
+      position: absolute;
+      bottom: 58px;
+      left: 50%;
+      transform: translateX(-50%);
+      width: 82%;
+      max-width: 340px;
+      align-items: center;
+      justify-content: flex-end;
+      -webkit-app-region: no-drag;
+    }
+
+    #settings-button {
+      width: 26px;
+      height: 26px;
+      border-radius: 50%;
+      border: none;
+      outline: none;
+      background: rgba(255, 255, 255, 0.85);
+      font-size: 13px;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      cursor: pointer;
+      box-shadow: 0 2px 6px rgba(0, 0, 0, 0.15);
+      -webkit-app-region: no-drag;
+    }
+
+    #settings-overlay {
+      display: none;
+      position: absolute;
+      top: 50%;
+      left: 50%;
+      transform: translate(-50%, -50%);
+      width: 84%;
+      max-width: 300px;
+      flex-direction: column;
+      gap: 10px;
+      background: rgba(255, 255, 255, 0.95);
+      padding: 18px;
+      border-radius: 14px;
+      box-shadow: 0 4px 16px rgba(0, 0, 0, 0.25);
+      font-family: Arial, sans-serif;
+      -webkit-app-region: no-drag;
+    }
+
+    #settings-overlay h2 {
+      margin: 0 0 4px;
+      font-size: 15px;
+      color: #333;
+      text-align: center;
+    }
+
+    #settings-overlay label {
+      font-size: 11px;
+      color: #555;
+      margin-bottom: 2px;
+      display: block;
+    }
+
+    #settings-overlay input {
+      box-sizing: border-box;
+      width: 100%;
+      padding: 8px 10px;
+      border: 1px solid #ddd;
+      border-radius: 8px;
+      outline: none;
+      font-size: 13px;
+      color: #333;
+      -webkit-app-region: no-drag;
+    }
+
+    #settings-usage {
+      display: flex;
+      flex-direction: column;
+      gap: 4px;
+    }
+
+    #settings-usage-label {
+      font-size: 12px;
+      color: #555;
+      text-align: center;
+    }
+
+    #settings-usage-track {
+      width: 100%;
+      height: 8px;
+      background: #eee;
+      border-radius: 4px;
+      overflow: hidden;
+    }
+
+    #settings-usage-fill {
+      height: 100%;
+      width: 0%;
+      background: #6c5ce7;
+      border-radius: 4px;
+      transition: width 0.3s ease;
+    }
+
+    #settings-buttons {
+      display: flex;
+      gap: 8px;
+      margin-top: 4px;
+    }
+
+    #settings-buttons button {
+      flex: 1;
+      padding: 9px;
+      border: none;
+      border-radius: 8px;
+      font-size: 13px;
+      font-weight: bold;
+      cursor: pointer;
+      -webkit-app-region: no-drag;
+    }
+
+    #settings-save {
+      background: #6c5ce7;
+      color: white;
+    }
+
+    #settings-save:disabled {
+      opacity: 0.6;
+      cursor: default;
+    }
+
+    #settings-close {
+      background: #eee;
+      color: #333;
+    }
+
+    #settings-error {
+      display: none;
+      font-size: 11px;
+      color: #e53935;
+      text-align: center;
     }
 
     #mic-button {
@@ -102,23 +320,6 @@
       -webkit-app-region: no-drag;
     }
 
-    #chat-error {
-      display: none;
-      position: absolute;
-      bottom: 54px;
-      left: 50%;
-      transform: translateX(-50%);
-      width: 82%;
-      max-width: 340px;
-      background: rgba(229, 57, 53, 0.95);
-      color: white;
-      padding: 6px 10px;
-      border-radius: 8px;
-      font-size: 11px;
-      font-family: Arial, sans-serif;
-      text-align: center;
-      box-shadow: 0 2px 8px rgba(0, 0, 0, 0.2);
-    }
   </style>
 
   <!--
@@ -142,10 +343,46 @@
 <body>
   <canvas id="character-canvas"></canvas>
   <div id="speech-bubble"></div>
-  <div id="chat-error"></div>
+  <div id="chat-toolbar">
+    <button id="settings-button" type="button" aria-label="Settings">⚙️</button>
+  </div>
+
   <div id="chat-container">
     <button id="mic-button" type="button" aria-label="Voice input">🎤</button>
     <input id="chat-input" type="text" placeholder="Type a message..." autocomplete="off" />
+  </div>
+
+  <div id="settings-overlay">
+    <h2>Settings</h2>
+    <form id="settings-form">
+      <label for="settings-name">Name</label>
+      <input id="settings-name" type="text" autocomplete="off" required />
+      <label for="settings-goal">Goal</label>
+      <input id="settings-goal" type="text" autocomplete="off" required />
+      <div id="settings-usage">
+        <div id="settings-usage-label">-- / -- tokens today</div>
+        <div id="settings-usage-track">
+          <div id="settings-usage-fill"></div>
+        </div>
+      </div>
+      <div id="settings-error"></div>
+      <div id="settings-buttons">
+        <button id="settings-close" type="button">Close</button>
+        <button id="settings-save" type="submit">Save</button>
+      </div>
+    </form>
+  </div>
+
+  <div id="onboarding-overlay">
+    <h2>Welcome! Let's get to know each other</h2>
+    <form id="onboarding-form">
+      <label for="onboarding-name">What should I call you?</label>
+      <input id="onboarding-name" type="text" placeholder="Your name" autocomplete="off" required />
+      <label for="onboarding-goal">What's your main goal with Boltmos?</label>
+      <input id="onboarding-goal" type="text" placeholder="e.g. stay focused while studying" autocomplete="off" required />
+      <div id="onboarding-error"></div>
+      <button type="submit">Get started</button>
+    </form>
   </div>
 
   <script type="module" src="./renderer.js"></script>
@@ -154,7 +391,19 @@
     const speechBubble = document.getElementById('speech-bubble');
     let speechTimeout = null;
 
-    window.showSpeech = function showSpeech(text, duration = 3000) {
+    // Duration is derived from the text itself (~50ms/char, clamped to a
+    // 3-12s window) rather than a fixed value, so a short reply clears
+    // quickly and a long one stays up long enough to actually read.
+    const SPEECH_MS_PER_CHAR = 50;
+    const SPEECH_MIN_DURATION_MS = 3000;
+    const SPEECH_MAX_DURATION_MS = 12000;
+
+    window.showSpeech = function showSpeech(text) {
+      const duration = Math.min(
+        SPEECH_MAX_DURATION_MS,
+        Math.max(SPEECH_MIN_DURATION_MS, text.length * SPEECH_MS_PER_CHAR),
+      );
+
       speechBubble.textContent = text;
       speechBubble.style.display = 'block';
 

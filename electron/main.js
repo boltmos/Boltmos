@@ -1,8 +1,29 @@
 const { app, BrowserWindow, Tray, Menu, ipcMain, nativeImage, screen } = require('electron');
+const crypto = require('crypto');
+const fs = require('fs');
 const path = require('path');
 
 let win = null;
 let tray = null;
+let userId = null;
+
+// Minimal per-install identity: a random UUID generated once and persisted in
+// userData, so requests to the backend can be partitioned per install instead
+// of every install colliding into the backend's TEST_USER_ID placeholder.
+// This is not real auth - see the get_user_id() comment in backend/main.py
+// and backend/cloud/main.py for what it does and does not guarantee.
+function getOrCreateUserId() {
+  const filePath = path.join(app.getPath('userData'), 'user-id.json');
+  try {
+    const existing = JSON.parse(fs.readFileSync(filePath, 'utf-8'));
+    if (existing.userId) return existing.userId;
+  } catch (error) {
+    // File missing, unreadable, or malformed - fall through and generate one.
+  }
+  const generated = crypto.randomUUID();
+  fs.writeFileSync(filePath, JSON.stringify({ userId: generated }));
+  return generated;
+}
 
 function createWindow() {
   const { width: screenWidth, height: screenHeight } = screen.getPrimaryDisplay().workAreaSize;
@@ -61,8 +82,11 @@ function createTray() {
 }
 
 app.whenReady().then(() => {
+  userId = getOrCreateUserId();
   createWindow();
   createTray();
+
+  ipcMain.handle('get-user-id', () => userId);
 
   ipcMain.on('move-window', (_event, { x, y }) => {
     if (win) {

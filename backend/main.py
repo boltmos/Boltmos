@@ -5,6 +5,9 @@ import json
 import logging
 import os
 import subprocess
+import time
+import uuid
+from datetime import date
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 
@@ -14,9 +17,9 @@ import soundfile as sf
 import uvicorn
 import websockets
 from dotenv import load_dotenv
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
-from groq import Groq
+from groq import BadRequestError, Groq
 from kokoro import KPipeline
 from PIL import ImageGrab
 from supabase import create_client, Client
@@ -188,6 +191,16 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+
+@app.get("/health")
+async def health_check():
+    """Liveness check for Railway (or any host) to poll - deliberately just
+    confirms the FastAPI process itself is up and responding, not that Groq/
+    Supabase/Kokoro are reachable, so a transient third-party outage doesn't
+    get the whole service marked unhealthy and restarted."""
+    return {"status": "ok"}
+
+
 KNOWN_APPS = {
     "chrome": r"C:\Program Files\Google\Chrome\Application\chrome.exe",
     "google chrome": r"C:\Program Files\Google\Chrome\Application\chrome.exe",
@@ -309,8 +322,30 @@ else:
     except Exception as error:
         print(f"Supabase connection test failed: {error}")
 
-# Placeholder until real user accounts exist - all chat history logs under this one user_id.
+# Fallback for requests with no (or a malformed) X-User-Id header - keeps
+# curl/dev testing working without a real Electron client attached.
 TEST_USER_ID = "00000000-0000-0000-0000-000000000001"
+
+
+def get_user_id(request: Request) -> str:
+    """Reads the per-install user_id the Electron app generates once
+    (crypto.randomUUID(), persisted in userData - see electron/main.js) and
+    sends as X-User-Id on every request, so chat history/profile/usage stop
+    colliding into one shared row across every install.
+
+    SECURITY NOTE: this is a partitioning key, not authentication. Nothing
+    here verifies the header actually came from the install that "owns" that
+    id - a request with no header falls back to TEST_USER_ID below, and a
+    request with any other well-formed UUID is accepted as-is and reads/
+    writes that user's data. Do not treat a request validated by this
+    function as authenticated until a real auth system (e.g. Supabase Auth)
+    replaces it.
+    """
+    raw_user_id = request.headers.get("x-user-id", "")
+    try:
+        return str(uuid.UUID(raw_user_id))
+    except ValueError:
+        return TEST_USER_ID
 
 KOKORO_VOICE = "af_heart"
 KOKORO_SAMPLE_RATE = 24000
@@ -408,13 +443,30 @@ def is_step_safe(step: dict) -> bool:
     return not any(pattern in step_text for pattern in dangerous_patterns)
 
 
-async def execute_steps(steps: list, websocket_send):
+FOCUS_SENSITIVE_ACTIONS = {"navigate", "search_google", "search_youtube"}
+# A cold app launch (subprocess.Popen -> window created -> window takes OS
+# focus) routinely takes longer than open_app's own post-launch sleep, so a
+# focus-sensitive step immediately after open_app risks sending its keystrokes
+# to whatever window still has focus instead of the just-opened one. Extra
+# settle time only applies to that one specific transition, on top of
+# whatever "wait" the plan already assigned that step.
+POST_OPEN_APP_FOCUS_DELAY_S = 1.0
+
+
+async def execute_steps(steps: list, websocket_send) -> bool:
+    """Runs every step and returns whether they all succeeded - callers (just
+    handle_task below) use this to decide between the task_done/task_failed
+    speech so a task that silently failed partway through no longer reports
+    "all done" anyway."""
     last_extracted_text = ""
+    previous_action = None
+    all_succeeded = True
 
     for index, step in enumerate(steps, start=1):
         if not isinstance(step, dict):
             print(f"STEP {index}/{len(steps)}: {step!r} action=None value=None validation=FAILED (not a dict)")
             task_logger.error(f"STEP {index}/{len(steps)} step={step!r} -> FAILED: not a dict")
+            all_succeeded = False
             continue
 
         action = step.get("action")
@@ -429,6 +481,7 @@ async def execute_steps(steps: list, websocket_send):
         if not is_safe:
             print(f"BLOCKED step {index} as dangerous: {step}")
             task_logger.warning(f"STEP {index}/{len(steps)} action={action!r} value={value!r} -> BLOCKED (unsafe)")
+            all_succeeded = False
             continue
 
         message = step.get("message", "")
@@ -437,6 +490,9 @@ async def execute_steps(steps: list, websocket_send):
             wait_before = float(step.get("wait", 1.0))
         except (TypeError, ValueError):
             wait_before = 1.0
+
+        if previous_action == "open_app" and action in FOCUS_SENSITIVE_ACTIONS:
+            wait_before += POST_OPEN_APP_FOCUS_DELAY_S
 
         # Always wait specified time before each step
         await asyncio.sleep(wait_before)
@@ -456,8 +512,11 @@ async def execute_steps(steps: list, websocket_send):
                         if os.path.exists(app_path):
                             subprocess.Popen(app_path)
                             opened = True
-                            # Wait longer for app to fully open
-                            await asyncio.sleep(0.5)
+                            # Wait longer for app to fully open and take OS
+                            # focus - was 0.5s, which a cold launch can easily
+                            # outlast, leaving the next step's keystrokes to
+                            # land on whatever window still had focus.
+                            await asyncio.sleep(1.5)
                             break
                 if not opened:
                     pyautogui.hotkey("win", "s")
@@ -547,6 +606,11 @@ async def execute_steps(steps: list, websocket_send):
         task_logger.info(
             f"STEP {index}/{len(steps)} action={action!r} value={value!r} -> {step_outcome}"
         )
+        if step_outcome.startswith("FAILED"):
+            all_succeeded = False
+        previous_action = action
+
+    return all_succeeded
 
 
 connected_clients = set()
@@ -615,6 +679,7 @@ async def handle_task(body: dict):
     # queuing, since a queued task would otherwise fire unattended
     # automation later with no way for the user to know it's about to start.
     if task_lock.locked():
+        await send_to_lyra({"action": "speak", "text": "hold on, I'm still doing the last thing - one sec!"})
         return {"success": False, "reason": "busy", "message": "A task is already in progress"}
 
     async with task_lock:
@@ -647,67 +712,165 @@ async def handle_task(body: dict):
             await send_to_lyra({"action": "speak", "text": summary})
             await asyncio.sleep(1.5)
 
-        await execute_steps(steps, send_to_lyra)
+        task_succeeded = await execute_steps(steps, send_to_lyra)
 
-        await send_to_lyra({"action": "task_done", "text": "all done! ✨"})
+        if task_succeeded:
+            await send_to_lyra({"action": "task_done", "text": "all done! ✨"})
+        else:
+            await send_to_lyra({
+                "action": "task_failed",
+                "text": "I couldn't quite get that done, want me to try again?",
+            })
 
-        return {"success": True, "steps": len(steps)}
+        return {"success": task_succeeded, "steps": len(steps)}
 
 
-@app.post("/chat")
-async def handle_chat(body: dict):
-    message = body.get("message", "")
-    if not message:
-        return {"success": False, "reason": "empty message"}
+@app.get("/profile")
+async def get_profile(request: Request):
+    if not supabase_client:
+        return {"exists": False}
+    user_id = get_user_id(request)
+    try:
+        response = await asyncio.to_thread(
+            supabase_client.table("user_profile")
+            .select("name, primary_goal")
+            .eq("user_id", user_id)
+            .limit(1)
+            .execute
+        )
+        if response.data:
+            row = response.data[0]
+            return {"exists": True, "name": row["name"], "goal": row["primary_goal"]}
+        return {"exists": False}
+    except Exception as error:
+        print(f"Supabase profile fetch failed: {error}")
+        return {"exists": False}
 
-    if any(word in message.lower() for word in DANGEROUS_WORDS):
-        await send_to_lyra({"action": "speak", "text": "I cannot do that safely"})
-        return {"success": False, "reason": "blocked"}
 
-    history_messages = []
+@app.put("/profile")
+async def update_profile(request: Request, body: dict):
+    name = (body.get("name") or "").strip()
+    goal = (body.get("goal") or "").strip()
+    if not name or not goal:
+        return {"success": False, "reason": "name and goal are required"}
+    if not supabase_client:
+        return {"success": False, "reason": "database unavailable"}
+
+    try:
+        await asyncio.to_thread(
+            supabase_client.table("user_profile")
+            .update({"name": name, "primary_goal": goal})
+            .eq("user_id", get_user_id(request))
+            .execute
+        )
+        return {"success": True}
+    except Exception as error:
+        print(f"Supabase profile update failed: {error}")
+        return {"success": False, "reason": "database error"}
+
+
+DAILY_TOKEN_LIMIT = 50000
+
+
+def today_str() -> str:
+    return date.today().isoformat()
+
+
+async def get_daily_token_usage(user_id: str) -> int:
+    if not supabase_client:
+        return 0
+    try:
+        response = await asyncio.to_thread(
+            supabase_client.table("user_daily_usage")
+            .select("tokens_used")
+            .eq("user_id", user_id)
+            .eq("date", today_str())
+            .limit(1)
+            .execute
+        )
+        if response.data:
+            return response.data[0]["tokens_used"]
+        return 0
+    except Exception as error:
+        print(f"Supabase daily usage fetch failed: {error}")
+        return 0
+
+
+async def add_daily_token_usage(user_id: str, tokens: int) -> int:
+    if not supabase_client:
+        return 0
+    try:
+        new_total = await get_daily_token_usage(user_id) + tokens
+        await asyncio.to_thread(
+            supabase_client.table("user_daily_usage")
+            .upsert(
+                {"user_id": user_id, "date": today_str(), "tokens_used": new_total},
+                on_conflict="user_id,date",
+            )
+            .execute
+        )
+        return new_total
+    except Exception as error:
+        print(f"Supabase daily usage update failed: {error}")
+        return 0
+
+
+@app.get("/usage")
+async def get_usage(request: Request):
+    tokens_used = await get_daily_token_usage(get_user_id(request))
+    return {"tokens_used": tokens_used, "token_limit": DAILY_TOKEN_LIMIT}
+
+
+@app.post("/profile")
+async def create_profile(request: Request, body: dict):
+    name = (body.get("name") or "").strip()
+    goal = (body.get("goal") or "").strip()
+    if not name or not goal:
+        return {"success": False, "reason": "name and goal are required"}
+
+    user_id = get_user_id(request)
+
     if supabase_client:
         try:
-            history_response = await asyncio.to_thread(
-                supabase_client.table("conversation_history")
-                .select("role, message")
-                .eq("user_id", TEST_USER_ID)
-                .order("created_at", desc=True)
-                .limit(10)
+            await asyncio.to_thread(
+                supabase_client.table("user_profile")
+                .insert({"user_id": user_id, "name": name, "primary_goal": goal})
                 .execute
             )
-            history_messages = [
-                {"role": row["role"], "content": row["message"]}
-                for row in reversed(history_response.data)
-            ]
         except Exception as error:
-            print(f"Supabase conversation_history fetch failed: {error}")
+            print(f"Supabase profile insert failed: {error}")
+            return {"success": False, "reason": "database error"}
 
-    if not groq_client:
-        reply_text = "I can't chat right now, my brain (Groq) isn't connected."
-        emotion = "neutral"
-    else:
+    reply_text = f"Hi {name}! I'm Lyra - I heard you're here to {goal}. I'm excited to help you with that!"
+    emotion = "happy"
+
+    if groq_client:
         try:
             response = await asyncio.to_thread(
                 groq_client.chat.completions.create,
                 model=GROQ_MODEL,
                 messages=[
                     {"role": "system", "content": CHAT_SYSTEM_PROMPT},
-                    *history_messages,
-                    {"role": "user", "content": message},
+                    {
+                        "role": "user",
+                        "content": (
+                            f'This is the very first time meeting {name}. Their goal for using '
+                            f'you is: "{goal}". Greet them warmly by name and briefly '
+                            "acknowledge their goal."
+                        ),
+                    },
                 ],
                 response_format={"type": "json_object"},
             )
             result = json.loads(response.choices[0].message.content)
-            reply_text = (result.get("text") or "").strip()
-            emotion = result.get("emotion")
-            if emotion not in VALID_CHAT_EMOTIONS:
-                emotion = "neutral"
-            if not reply_text:
-                reply_text = "Sorry, I couldn't think of a reply just now."
+            candidate_text = (result.get("text") or "").strip()
+            candidate_emotion = result.get("emotion")
+            if candidate_text:
+                reply_text = candidate_text
+            if candidate_emotion in VALID_CHAT_EMOTIONS:
+                emotion = candidate_emotion
         except Exception as error:
-            print(f"Groq chat call failed: {error}")
-            reply_text = "Sorry, I couldn't think of a reply just now."
-            emotion = "neutral"
+            print(f"Groq onboarding greeting call failed: {error}")
 
     audio_b64 = await speak_text(reply_text, emotion)
 
@@ -720,10 +883,147 @@ async def handle_chat(body: dict):
             await asyncio.to_thread(
                 supabase_client.table("conversation_history")
                 .insert(
+                    {
+                        "user_id": user_id,
+                        "role": "assistant",
+                        "message": reply_text,
+                        "emotion": emotion,
+                    }
+                )
+                .execute
+            )
+        except Exception as error:
+            print(f"Supabase conversation_history insert failed: {error}")
+
+    return {"success": True, "text": reply_text, "emotion": emotion}
+
+
+async def get_user_profile(user_id: str) -> dict | None:
+    if not supabase_client:
+        return None
+    try:
+        response = await asyncio.to_thread(
+            supabase_client.table("user_profile")
+            .select("name, primary_goal")
+            .eq("user_id", user_id)
+            .limit(1)
+            .execute
+        )
+        return response.data[0] if response.data else None
+    except Exception as error:
+        print(f"Supabase profile fetch failed: {error}")
+        return None
+
+
+@app.post("/chat")
+async def handle_chat(request: Request, body: dict):
+    message = body.get("message", "")
+    if not message:
+        return {"success": False, "reason": "empty message"}
+
+    if any(word in message.lower() for word in DANGEROUS_WORDS):
+        await send_to_lyra({"action": "speak", "text": "I cannot do that safely"})
+        return {"success": False, "reason": "blocked"}
+
+    user_id = get_user_id(request)
+
+    history_start = time.perf_counter()
+    history_messages = []
+    if supabase_client:
+        try:
+            history_response = await asyncio.to_thread(
+                supabase_client.table("conversation_history")
+                .select("role, message")
+                .eq("user_id", user_id)
+                .order("created_at", desc=True)
+                .limit(10)
+                .execute
+            )
+            history_messages = [
+                {"role": row["role"], "content": row["message"]}
+                for row in reversed(history_response.data)
+            ]
+        except Exception as error:
+            print(f"Supabase conversation_history fetch failed: {error}")
+    history_duration = time.perf_counter() - history_start
+
+    profile = await get_user_profile(user_id)
+    system_prompt = CHAT_SYSTEM_PROMPT
+    if profile:
+        system_prompt += (
+            f"\n\nThe user's name is {profile['name']}. Their goal for using you is: "
+            f"\"{profile['primary_goal']}\". Use their name naturally and keep their "
+            "goal in mind, without forcing either into every reply."
+        )
+
+    groq_start = time.perf_counter()
+    tokens_used_this_call = 0
+    if not groq_client:
+        reply_text = "I can't chat right now, my brain (Groq) isn't connected."
+        emotion = "neutral"
+    else:
+        groq_messages = [
+            {"role": "system", "content": system_prompt},
+            *history_messages,
+            {"role": "user", "content": message},
+        ]
+        for attempt in range(2):
+            try:
+                response = await asyncio.to_thread(
+                    groq_client.chat.completions.create,
+                    model=GROQ_MODEL,
+                    messages=groq_messages,
+                    response_format={"type": "json_object"},
+                )
+                if response.usage:
+                    tokens_used_this_call = response.usage.total_tokens
+                result = json.loads(response.choices[0].message.content)
+                reply_text = (result.get("text") or "").strip()
+                emotion = result.get("emotion")
+                if emotion not in VALID_CHAT_EMOTIONS:
+                    emotion = "neutral"
+                if not reply_text:
+                    reply_text = "Sorry, I couldn't think of a reply just now."
+                break
+            except BadRequestError as error:
+                is_parse_failure = (
+                    isinstance(error.body, dict)
+                    and error.body.get("error", {}).get("code") == "output_parse_failed"
+                )
+                if is_parse_failure and attempt == 0:
+                    print(f"Groq chat call failed with output_parse_failed, retrying once: {error}")
+                    continue
+                print(f"Groq chat call failed: {error}")
+                reply_text = "Sorry, I couldn't think of a reply just now."
+                emotion = "neutral"
+                break
+            except Exception as error:
+                print(f"Groq chat call failed: {error}")
+                reply_text = "Sorry, I couldn't think of a reply just now."
+                emotion = "neutral"
+                break
+    groq_duration = time.perf_counter() - groq_start
+
+    tokens_used_today = await add_daily_token_usage(user_id, tokens_used_this_call)
+
+    speak_start = time.perf_counter()
+    audio_b64 = await speak_text(reply_text, emotion)
+    speak_duration = time.perf_counter() - speak_start
+
+    await send_to_lyra_raw(
+        {"action": "speak", "text": reply_text, "emotion": emotion, "audio": audio_b64}
+    )
+
+    insert_start = time.perf_counter()
+    if supabase_client:
+        try:
+            await asyncio.to_thread(
+                supabase_client.table("conversation_history")
+                .insert(
                     [
-                        {"user_id": TEST_USER_ID, "role": "user", "message": message},
+                        {"user_id": user_id, "role": "user", "message": message},
                         {
-                            "user_id": TEST_USER_ID,
+                            "user_id": user_id,
                             "role": "assistant",
                             "message": reply_text,
                             "emotion": emotion,
@@ -734,12 +1034,32 @@ async def handle_chat(body: dict):
             )
         except Exception as error:
             print(f"Supabase conversation_history insert failed: {error}")
+    insert_duration = time.perf_counter() - insert_start
 
-    return {"success": True, "text": reply_text, "emotion": emotion}
+    task_logger.info(
+        f"CHAT TIMING: history_read={history_duration:.2f}s "
+        f"groq_call={groq_duration:.2f}s "
+        f"speak_text={speak_duration:.2f}s "
+        f"history_insert={insert_duration:.2f}s "
+        f"total={history_duration + groq_duration + speak_duration + insert_duration:.2f}s"
+    )
+
+    return {
+        "success": True,
+        "text": reply_text,
+        "emotion": emotion,
+        "tokens_used_today": tokens_used_today,
+        "token_limit": DAILY_TOKEN_LIMIT,
+    }
 
 
 async def main():
-    config = uvicorn.Config(app, host="0.0.0.0", port=8000, log_level="info")
+    # Railway assigns its own port at runtime via $PORT and routes external
+    # traffic to whatever that is - a hardcoded 8000 would make the deployed
+    # service unreachable. Falls back to 8000 for local dev, where nothing
+    # sets PORT.
+    port = int(os.getenv("PORT", 8000))
+    config = uvicorn.Config(app, host="0.0.0.0", port=port, log_level="info")
     server = uvicorn.Server(config)
 
     await asyncio.gather(

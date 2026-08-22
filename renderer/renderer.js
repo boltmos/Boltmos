@@ -167,6 +167,7 @@ loader.load(
 const mouse = new THREE.Vector2(0, 0);
 const CHARACTER_HOVER_RADIUS_PX = 120;
 const chatContainer = document.getElementById('chat-container');
+const speechBubbleEl = document.getElementById('speech-bubble');
 
 function isOverChatContainer(clientX, clientY) {
   if (!chatContainer) return false;
@@ -177,6 +178,31 @@ function isOverChatContainer(clientX, clientY) {
     clientY >= rect.top &&
     clientY <= rect.bottom
   );
+}
+
+// --- Other interactive UI added after the click-through logic above was
+// written (settings gear icon, settings panel, onboarding form) - looked up
+// by id on every call rather than cached at module load like chatContainer,
+// since these elements are created further down in this file. Hidden
+// elements are skipped explicitly: a display:none element's
+// getBoundingClientRect() is all zeros, which would otherwise false-match
+// the cursor sitting exactly at (0, 0). ---
+const EXTRA_INTERACTIVE_ELEMENT_IDS = ['settings-button', 'settings-overlay', 'onboarding-overlay'];
+
+function isOverElement(elementId, clientX, clientY) {
+  const el = document.getElementById(elementId);
+  if (!el || el.style.display === 'none') return false;
+  const rect = el.getBoundingClientRect();
+  return (
+    clientX >= rect.left &&
+    clientX <= rect.right &&
+    clientY >= rect.top &&
+    clientY <= rect.bottom
+  );
+}
+
+function isOverExtraInteractiveUI(clientX, clientY) {
+  return EXTRA_INTERACTIVE_ELEMENT_IDS.some((id) => isOverElement(id, clientX, clientY));
 }
 
 // --- Drag-to-move: lets clicking directly on her body (not the chat box)
@@ -264,7 +290,8 @@ window.addEventListener('mousemove', (event) => {
   // every frame in updateCameraFraming() - not window.innerWidth/2, which
   // only lined up with her while the window was cropped tightly around her.
   const isInteractive = isOnCharacter(event.clientX, event.clientY) ||
-    isOverChatContainer(event.clientX, event.clientY);
+    isOverChatContainer(event.clientX, event.clientY) ||
+    isOverExtraInteractiveUI(event.clientX, event.clientY);
 
   window.boltmos?.setIgnoreMouseEvents(!isInteractive);
 });
@@ -446,22 +473,27 @@ function walkInEntrance() {
 
 window.testWalkIn = walkInEntrance;
 
+// --- User identity: the per-install UUID electron/main.js generates and
+// persists in userData, fetched once over IPC and cached here so every
+// backend call below can send it as X-User-Id instead of the backend's
+// shared TEST_USER_ID placeholder. ---
+let cachedUserId = null;
+
+async function getUserId() {
+  if (!cachedUserId) {
+    cachedUserId = await window.boltmos.getUserId();
+  }
+  return cachedUserId;
+}
+
+async function backendHeaders(extra = {}) {
+  return { 'X-User-Id': await getUserId(), ...extra };
+}
+
 // --- Chat send: the single shared path both the Enter key and the mic
 // button funnel through, so text and voice input behave identically. ---
 const chatInput = document.getElementById('chat-input');
 const micButton = document.getElementById('mic-button');
-const chatError = document.getElementById('chat-error');
-
-let chatErrorTimeout = null;
-function showChatError(message, duration = 4000) {
-  if (!chatError) return;
-  chatError.textContent = message;
-  chatError.style.display = 'block';
-  clearTimeout(chatErrorTimeout);
-  chatErrorTimeout = setTimeout(() => {
-    chatError.style.display = 'none';
-  }, duration);
-}
 
 // Only messages that clearly request an action go to /task (the automation
 // planner, which can open apps, click, type, etc.). Everything else -
@@ -489,15 +521,19 @@ async function sendChatMessage(text) {
   try {
     const response = await fetch(`http://localhost:8000${endpoint}`, {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      headers: await backendHeaders({ 'Content-Type': 'application/json' }),
       body: JSON.stringify(payload),
     });
     if (!response.ok) {
       throw new Error(`Backend responded with status ${response.status}`);
     }
+    const data = await response.json();
+    if (typeof data.tokens_used_today === 'number') {
+      updateUsageDisplay(data.tokens_used_today, data.token_limit);
+    }
   } catch (error) {
     console.error('sendChatMessage failed:', error);
-    showChatError("Couldn't reach the backend - is it running?");
+    window.showSpeech?.("hmm, I can't reach my brain right now, give me a second");
   }
 }
 
@@ -507,6 +543,190 @@ if (chatInput) {
     const text = chatInput.value;
     chatInput.value = '';
     sendChatMessage(text);
+  });
+}
+
+// --- Onboarding: on first launch, collect the user's name and goal and
+// store them in Supabase (user_profile table, via POST /profile) before the
+// normal chat UI becomes usable. Skipped on every later launch once a
+// profile already exists for this user (checked once via GET /profile on
+// load). Lyra's first-message greeting is generated server-side inside
+// POST /profile and arrives through the normal WebSocket "speak" action -
+// same path handleLyraAction() already uses for every other reply, so no
+// separate greeting-display code is needed here. ---
+const onboardingOverlay = document.getElementById('onboarding-overlay');
+const onboardingForm = document.getElementById('onboarding-form');
+const onboardingNameInput = document.getElementById('onboarding-name');
+const onboardingGoalInput = document.getElementById('onboarding-goal');
+const onboardingError = document.getElementById('onboarding-error');
+
+const chatToolbar = document.getElementById('chat-toolbar');
+
+function showChatUI() {
+  if (chatContainer) chatContainer.style.display = 'flex';
+  if (chatToolbar) chatToolbar.style.display = 'flex';
+  if (onboardingOverlay) onboardingOverlay.style.display = 'none';
+  refreshUsageDisplay();
+}
+
+function showOnboardingUI() {
+  if (chatContainer) chatContainer.style.display = 'none';
+  if (chatToolbar) chatToolbar.style.display = 'none';
+  if (onboardingOverlay) onboardingOverlay.style.display = 'flex';
+}
+
+async function initOnboarding() {
+  try {
+    const response = await fetch('http://localhost:8000/profile', { headers: await backendHeaders() });
+    const data = await response.json();
+    if (data.exists) {
+      showChatUI();
+    } else {
+      showOnboardingUI();
+    }
+  } catch (error) {
+    console.error('Failed to check onboarding profile:', error);
+    // Backend unreachable - fall back to the normal chat UI rather than
+    // trapping the user behind a form that can't be submitted either.
+    showChatUI();
+  }
+}
+
+if (onboardingForm) {
+  onboardingForm.addEventListener('submit', async (event) => {
+    event.preventDefault();
+    const name = onboardingNameInput.value.trim();
+    const goal = onboardingGoalInput.value.trim();
+    if (!name || !goal) return;
+
+    const submitButton = onboardingForm.querySelector('button[type="submit"]');
+    if (submitButton) submitButton.disabled = true;
+    if (onboardingError) onboardingError.style.display = 'none';
+
+    try {
+      const response = await fetch('http://localhost:8000/profile', {
+        method: 'POST',
+        headers: await backendHeaders({ 'Content-Type': 'application/json' }),
+        body: JSON.stringify({ name, goal }),
+      });
+      const data = await response.json();
+      if (!response.ok || !data.success) {
+        throw new Error(data.reason || `status ${response.status}`);
+      }
+      showChatUI();
+    } catch (error) {
+      console.error('Onboarding submit failed:', error);
+      if (onboardingError) {
+        onboardingError.textContent = "Hmm, that didn't save - mind checking I'm still running and trying again?";
+        onboardingError.style.display = 'block';
+      }
+    } finally {
+      if (submitButton) submitButton.disabled = false;
+    }
+  });
+}
+
+initOnboarding();
+
+// --- Daily token usage: a progress bar inside the settings panel only
+// (#settings-usage) - deliberately not shown anywhere in the primary chat
+// UI. Backend tracks real Groq token usage per user per day in Supabase
+// (user_daily_usage, resets automatically since it's keyed by date) -
+// updateUsageDisplay() here just renders whatever total the backend last
+// reported, either from a fresh GET /usage (on load / opening settings) or
+// from the tokens_used_today field every /chat response already includes. ---
+const settingsUsageLabel = document.getElementById('settings-usage-label');
+const settingsUsageFill = document.getElementById('settings-usage-fill');
+
+function updateUsageDisplay(tokensUsed, tokenLimit) {
+  if (settingsUsageLabel) settingsUsageLabel.textContent = `${tokensUsed} / ${tokenLimit} tokens today`;
+  if (settingsUsageFill) {
+    const percent = tokenLimit > 0 ? (tokensUsed / tokenLimit) * 100 : 0;
+    settingsUsageFill.style.width = `${Math.min(100, Math.max(0, percent))}%`;
+  }
+}
+
+async function refreshUsageDisplay() {
+  try {
+    const response = await fetch('http://localhost:8000/usage', { headers: await backendHeaders() });
+    const data = await response.json();
+    updateUsageDisplay(data.tokens_used, data.token_limit);
+  } catch (error) {
+    console.error('Failed to fetch usage:', error);
+  }
+}
+
+// --- Settings panel: gear icon opens a small overlay (reusing the same
+// centered-card look as the onboarding form) prefilled with the current
+// name/goal from GET /profile. Saving PUTs the edited values back to
+// /profile, which updates the same user_profile row onboarding created. ---
+const settingsButton = document.getElementById('settings-button');
+const settingsOverlay = document.getElementById('settings-overlay');
+const settingsForm = document.getElementById('settings-form');
+const settingsNameInput = document.getElementById('settings-name');
+const settingsGoalInput = document.getElementById('settings-goal');
+const settingsCloseButton = document.getElementById('settings-close');
+const settingsError = document.getElementById('settings-error');
+
+async function openSettings() {
+  if (settingsError) settingsError.style.display = 'none';
+  try {
+    const response = await fetch('http://localhost:8000/profile', { headers: await backendHeaders() });
+    const data = await response.json();
+    if (data.exists) {
+      settingsNameInput.value = data.name || '';
+      settingsGoalInput.value = data.goal || '';
+    }
+  } catch (error) {
+    console.error('Failed to load profile for settings:', error);
+  }
+  refreshUsageDisplay();
+  if (settingsOverlay) settingsOverlay.style.display = 'flex';
+}
+
+function closeSettings() {
+  if (settingsOverlay) settingsOverlay.style.display = 'none';
+}
+
+if (settingsButton) {
+  settingsButton.addEventListener('click', openSettings);
+}
+
+if (settingsCloseButton) {
+  settingsCloseButton.addEventListener('click', closeSettings);
+}
+
+if (settingsForm) {
+  settingsForm.addEventListener('submit', async (event) => {
+    event.preventDefault();
+    const name = settingsNameInput.value.trim();
+    const goal = settingsGoalInput.value.trim();
+    if (!name || !goal) return;
+
+    const saveButton = document.getElementById('settings-save');
+    if (saveButton) saveButton.disabled = true;
+    if (settingsError) settingsError.style.display = 'none';
+
+    try {
+      const response = await fetch('http://localhost:8000/profile', {
+        method: 'PUT',
+        headers: await backendHeaders({ 'Content-Type': 'application/json' }),
+        body: JSON.stringify({ name, goal }),
+      });
+      const data = await response.json();
+      if (!response.ok || !data.success) {
+        throw new Error(data.reason || `status ${response.status}`);
+      }
+      closeSettings();
+    } catch (error) {
+      console.error('Settings save failed:', error);
+      if (settingsError) {
+        settingsError.textContent = "Hmm, that didn't save - mind checking I'm still running and trying again?";
+        settingsError.style.display = 'block';
+      }
+    } finally {
+      if (saveButton) saveButton.disabled = false;
+    }
   });
 }
 
@@ -536,7 +756,7 @@ if (SpeechRecognitionCtor) {
     isListening = false;
     micButton?.classList.remove('mic-active');
     setListeningPosture(false);
-    showChatError('Voice input failed - please try again.');
+    window.showSpeech?.("sorry, I didn't catch that - mind trying again?");
   };
 
   // Recognition ends asynchronously after .stop() is called (or on its own
@@ -573,7 +793,7 @@ function setListeningPosture(active) {
 
 function startListening() {
   if (!recognition) {
-    showChatError('Voice input is not supported in this app.');
+    window.showSpeech?.("I can't listen for voice on this device, but typing works great!");
     return;
   }
   if (isListening) return;
@@ -588,6 +808,7 @@ function startListening() {
     isListening = false;
     micButton.classList.remove('mic-active');
     setListeningPosture(false);
+    window.showSpeech?.("hmm, I couldn't start listening just now");
   }
 }
 
@@ -1328,6 +1549,35 @@ let cameraDistance = CAMERA_BASE_DISTANCE;
 // deriving a position from window.innerWidth/innerHeight.
 let characterScreenX = window.innerWidth / 2;
 let characterScreenY = window.innerHeight / 2;
+// Her projected feet position, computed alongside characterScreenX/Y below -
+// #chat-container's vertical position is pinned to this every frame instead
+// of a fixed CSS offset, so it stays right below her regardless of how her
+// height/zoom/framing changes (see positionChatContainer() below).
+let characterFeetScreenY = window.innerHeight / 2;
+const CHAT_CONTAINER_GAP_PX = 16;
+
+function positionChatContainer() {
+  if (!chatContainer) return;
+  const containerHeight = chatContainer.offsetHeight || 60;
+  const maxTop = window.innerHeight - containerHeight - 8;
+  const top = Math.min(characterFeetScreenY + CHAT_CONTAINER_GAP_PX, maxTop);
+  chatContainer.style.top = `${top}px`;
+}
+
+// Same fixed-offset problem #chat-container had: her projected head-top
+// position, tracked the same way characterFeetScreenY is above, so the
+// speech bubble sits just above her actual head every frame instead of a
+// fixed window-top offset that only lined up with her in the old
+// cropped-to-character window layout.
+let characterHeadScreenY = window.innerHeight / 2;
+const SPEECH_BUBBLE_GAP_PX = 10;
+
+function positionSpeechBubble() {
+  if (!speechBubbleEl) return;
+  const bubbleHeight = speechBubbleEl.offsetHeight || 40;
+  const top = Math.max(8, characterHeadScreenY - bubbleHeight - SPEECH_BUBBLE_GAP_PX);
+  speechBubbleEl.style.top = `${top}px`;
+}
 
 function getBoneWorldY(bone) {
   bone.getWorldPosition(_boneWorldPos);
@@ -1390,6 +1640,17 @@ function updateCameraFraming(vrm) {
   _screenProjectPos.project(camera);
   characterScreenX = (_screenProjectPos.x * 0.5 + 0.5) * window.innerWidth;
   characterScreenY = (-_screenProjectPos.y * 0.5 + 0.5) * window.innerHeight;
+
+  _screenProjectPos.set(originX, feetY, 0);
+  _screenProjectPos.project(camera);
+  characterFeetScreenY = (-_screenProjectPos.y * 0.5 + 0.5) * window.innerHeight;
+
+  _screenProjectPos.set(originX, headTopY, 0);
+  _screenProjectPos.project(camera);
+  characterHeadScreenY = (-_screenProjectPos.y * 0.5 + 0.5) * window.innerHeight;
+
+  positionChatContainer();
+  positionSpeechBubble();
 }
 
 // animateLoopErrorLogged prevents one persistent per-frame error (e.g. a bad
@@ -1573,10 +1834,10 @@ function handleLyraAction(data) {
     const screenCenterX = window.screen.width / 2;
     const diff = (data.x - screenCenterX) / window.screen.width;
     animState.head.y = diff * 0.4;
-    if (data.text) window.showSpeech?.(data.text, 2000);
+    if (data.text) window.showSpeech?.(data.text);
   } else if (data.action === 'thinking') {
     animState.head.z = 0.05;
-    if (data.text) window.showSpeech?.(data.text, 2000);
+    if (data.text) window.showSpeech?.(data.text);
   } else if (data.action === 'task_done') {
     animState.head.x = 0;
     animState.head.y = 0;
@@ -1587,13 +1848,13 @@ function handleLyraAction(data) {
       expressionManager.setValue('happy', 0.8);
       setTimeout(() => expressionManager.setValue('happy', 0), 2000);
     }
-    if (data.text) window.showSpeech?.(data.text, 3000);
+    if (data.text) window.showSpeech?.(data.text);
   } else if (data.action === 'task_failed') {
     animState.head.z = -0.1;
-    if (data.text) window.showSpeech?.(data.text, 3000);
+    if (data.text) window.showSpeech?.(data.text);
   } else if (data.action === 'speak' && typeof data.text === 'string') {
     console.log('WebSocket speak message received:', data);
-    window.showSpeech?.(data.text, 3000);
+    window.showSpeech?.(data.text);
     if (data.emotion) setEmotionState(data.emotion);
     if (typeof data.audio === 'string' && data.audio) playAudioWithMouthSync(data.audio);
   }
