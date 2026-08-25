@@ -404,6 +404,7 @@
         Math.max(SPEECH_MIN_DURATION_MS, text.length * SPEECH_MS_PER_CHAR),
       );
 
+      console.log('showSpeech about to display in chat bubble:', text);
       speechBubble.textContent = text;
       speechBubble.style.display = 'block';
 

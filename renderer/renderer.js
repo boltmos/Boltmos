@@ -4,6 +4,9 @@ import { VRMLoaderPlugin, VRMUtils } from '@pixiv/three-vrm';
 
 const MODEL_URL = '../assets/lyra6.vrm';
 
+// Switch to 'http://localhost:8000' for local backend development.
+const BACKEND_URL = 'https://boltmos.up.railway.app';
+
 const canvas = document.getElementById('character-canvas');
 
 const renderer = new THREE.WebGLRenderer({
@@ -512,24 +515,36 @@ function isActionRequest(text) {
 
 async function sendChatMessage(text) {
   const trimmed = (text || '').trim();
+  console.log('sendChatMessage called with text:', text);
   if (!trimmed) return;
 
   const isTask = isActionRequest(trimmed);
   const endpoint = isTask ? '/task' : '/chat';
   const payload = isTask ? { task: trimmed } : { message: trimmed };
+  const url = `${BACKEND_URL}${endpoint}`;
+  console.log('sendChatMessage fetching URL:', url);
 
   try {
-    const response = await fetch(`http://localhost:8000${endpoint}`, {
+    const response = await fetch(url, {
       method: 'POST',
       headers: await backendHeaders({ 'Content-Type': 'application/json' }),
       body: JSON.stringify(payload),
     });
+    console.log('sendChatMessage response status:', response.status);
     if (!response.ok) {
       throw new Error(`Backend responded with status ${response.status}`);
     }
     const data = await response.json();
+    console.log('sendChatMessage parsed JSON response:', data);
     if (typeof data.tokens_used_today === 'number') {
       updateUsageDisplay(data.tokens_used_today, data.token_limit);
+    }
+    // /chat replies arrive directly in this HTTP response (unlike /task,
+    // which - when running against the local backend - still streams
+    // multi-step progress over the WebSocket via handleLyraAction).
+    if (!isTask && data.text) {
+      window.showSpeech?.(data.text);
+      if (data.emotion) setEmotionState(data.emotion);
     }
   } catch (error) {
     console.error('sendChatMessage failed:', error);
@@ -539,10 +554,17 @@ async function sendChatMessage(text) {
 
 if (chatInput) {
   chatInput.addEventListener('keydown', (event) => {
+    console.log('chat-input keydown:', event.key);
     if (event.key !== 'Enter') return;
     const text = chatInput.value;
     chatInput.value = '';
     sendChatMessage(text);
+  });
+  chatInput.addEventListener('focus', () => {
+    console.log('chat-input focus');
+  });
+  chatInput.addEventListener('blur', () => {
+    console.log('chat-input blur');
   });
 }
 
@@ -577,7 +599,7 @@ function showOnboardingUI() {
 
 async function initOnboarding() {
   try {
-    const response = await fetch('http://localhost:8000/profile', { headers: await backendHeaders() });
+    const response = await fetch(`${BACKEND_URL}/profile`, { headers: await backendHeaders() });
     const data = await response.json();
     if (data.exists) {
       showChatUI();
@@ -604,7 +626,7 @@ if (onboardingForm) {
     if (onboardingError) onboardingError.style.display = 'none';
 
     try {
-      const response = await fetch('http://localhost:8000/profile', {
+      const response = await fetch(`${BACKEND_URL}/profile`, {
         method: 'POST',
         headers: await backendHeaders({ 'Content-Type': 'application/json' }),
         body: JSON.stringify({ name, goal }),
@@ -648,7 +670,7 @@ function updateUsageDisplay(tokensUsed, tokenLimit) {
 
 async function refreshUsageDisplay() {
   try {
-    const response = await fetch('http://localhost:8000/usage', { headers: await backendHeaders() });
+    const response = await fetch(`${BACKEND_URL}/usage`, { headers: await backendHeaders() });
     const data = await response.json();
     updateUsageDisplay(data.tokens_used, data.token_limit);
   } catch (error) {
@@ -671,7 +693,7 @@ const settingsError = document.getElementById('settings-error');
 async function openSettings() {
   if (settingsError) settingsError.style.display = 'none';
   try {
-    const response = await fetch('http://localhost:8000/profile', { headers: await backendHeaders() });
+    const response = await fetch(`${BACKEND_URL}/profile`, { headers: await backendHeaders() });
     const data = await response.json();
     if (data.exists) {
       settingsNameInput.value = data.name || '';
@@ -708,7 +730,7 @@ if (settingsForm) {
     if (settingsError) settingsError.style.display = 'none';
 
     try {
-      const response = await fetch('http://localhost:8000/profile', {
+      const response = await fetch(`${BACKEND_URL}/profile`, {
         method: 'PUT',
         headers: await backendHeaders({ 'Content-Type': 'application/json' }),
         body: JSON.stringify({ name, goal }),

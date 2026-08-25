@@ -47,6 +47,10 @@ function createWindow() {
 
   win.loadFile(path.join(__dirname, '../renderer/index.html'));
 
+  win.webContents.on('console-message', (_event, _level, message) => {
+    console.log('[renderer]', message);
+  });
+
   win.on('close', (event) => {
     event.preventDefault();
     win.hide();
