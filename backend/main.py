@@ -5,22 +5,20 @@ import json
 import logging
 import os
 import subprocess
+import sys
 import time
 import uuid
 from datetime import date
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 
-import numpy as np
 import pyautogui
-import soundfile as sf
 import uvicorn
 import websockets
 from dotenv import load_dotenv
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from groq import BadRequestError, Groq
-from kokoro import KPipeline
 from PIL import ImageGrab
 from supabase import create_client, Client
 
@@ -169,7 +167,15 @@ async def extract_search_results_text() -> str:
         return ""
 
 
-load_dotenv(Path(__file__).resolve().parent.parent / ".env")
+# __file__-relative resolution only works running from source - a frozen
+# PyInstaller exe's __file__ doesn't point at a real path next to the
+# installed exe, so .env would silently fail to load there. When frozen,
+# look next to the exe itself instead.
+if getattr(sys, "frozen", False):
+    ENV_PATH = Path(sys.executable).resolve().parent / ".env"
+else:
+    ENV_PATH = Path(__file__).resolve().parent.parent / ".env"
+load_dotenv(ENV_PATH)
 
 LOG_DIR = Path(__file__).resolve().parent / "logs"
 LOG_DIR.mkdir(exist_ok=True)
@@ -194,10 +200,10 @@ app.add_middleware(
 
 @app.get("/health")
 async def health_check():
-    """Liveness check for Railway (or any host) to poll - deliberately just
-    confirms the FastAPI process itself is up and responding, not that Groq/
-    Supabase/Kokoro are reachable, so a transient third-party outage doesn't
-    get the whole service marked unhealthy and restarted."""
+    """Liveness check for the Electron app (or any host) to poll -
+    deliberately just confirms the FastAPI process itself is up and
+    responding, not that Groq/Supabase are reachable, so a transient
+    third-party outage doesn't get the whole service marked unhealthy."""
     return {"status": "ok"}
 
 
@@ -346,51 +352,6 @@ def get_user_id(request: Request) -> str:
         return str(uuid.UUID(raw_user_id))
     except ValueError:
         return TEST_USER_ID
-
-KOKORO_VOICE = "af_heart"
-KOKORO_SAMPLE_RATE = 24000
-# 1.0 is Kokoro's default pace for this voice pack - reads slightly slow/flat
-# for back-and-forth chat. Nudged up for a snappier conversational cadence;
-# Kokoro's own model card treats roughly 0.8-1.3 as the safe range before
-# articulation starts to degrade, so this has headroom either direction if it
-# needs retuning by ear.
-KOKORO_SPEED = 1.1
-
-try:
-    kokoro_pipeline = KPipeline(lang_code="a")
-except Exception as error:
-    kokoro_pipeline = None
-    print(f"Warning: Kokoro TTS failed to load, voice output disabled: {error}")
-
-
-async def speak_text(text: str, emotion: str) -> str:
-    """Generate speech audio for text with Kokoro's af_heart voice at
-    KOKORO_SPEED and return it as a base64-encoded WAV string ("" if Kokoro
-    isn't available or text is empty). emotion isn't fed into generation yet
-    - speed is currently the only per-call prosody control Kokoro exposes,
-    and it's fixed rather than emotion-driven - the param is accepted now so
-    callers/logging have it on hand for whenever emotion-driven voice tuning
-    (e.g. per-emotion speed) is added."""
-    if not kokoro_pipeline or not text:
-        return ""
-
-    def generate_audio_b64() -> str:
-        chunks = [
-            audio
-            for _, _, audio in kokoro_pipeline(text, voice=KOKORO_VOICE, speed=KOKORO_SPEED)
-        ]
-        full_audio = np.concatenate(chunks) if len(chunks) > 1 else chunks[0]
-        buffer = io.BytesIO()
-        sf.write(buffer, full_audio, KOKORO_SAMPLE_RATE, format="WAV")
-        buffer.seek(0)
-        return base64.b64encode(buffer.read()).decode()
-
-    try:
-        return await asyncio.to_thread(generate_audio_b64)
-    except Exception as error:
-        print(f"speak_text failed: {error}")
-        return ""
-
 
 async def plan_steps(task: str) -> dict:
     fallback_steps = [{"action": "open_app", "value": task, "wait": 0.5}]
@@ -639,20 +600,6 @@ async def send_to_lyra_raw(message: dict):
             connected_clients.discard(client)
 
 
-async def send_to_lyra(message: dict):
-    """Broadcast a message to the frontend, and whenever it's a speak or
-    task_done message carrying text, attach base64 Kokoro audio for it under
-    the "audio" field before sending (the /chat endpoint generates and
-    attaches its own audio directly instead of going through here, so it
-    isn't double-generated)."""
-    if message.get("action") in ("speak", "task_done") and message.get("text"):
-        audio_b64 = await speak_text(message["text"], message.get("emotion", "neutral"))
-        if audio_b64:
-            message = {**message, "audio": audio_b64}
-
-    await send_to_lyra_raw(message)
-
-
 DANGEROUS_WORDS = ["password", "bank", "payment", "credit card", "delete", "format"]
 
 CHAT_SYSTEM_PROMPT = """You are Lyra, a friendly AI companion. Respond naturally
@@ -679,7 +626,7 @@ async def handle_task(body: dict):
     # queuing, since a queued task would otherwise fire unattended
     # automation later with no way for the user to know it's about to start.
     if task_lock.locked():
-        await send_to_lyra({"action": "speak", "text": "hold on, I'm still doing the last thing - one sec!"})
+        await send_to_lyra_raw({"action": "speak", "text": "hold on, I'm still doing the last thing - one sec!"})
         return {"success": False, "reason": "busy", "message": "A task is already in progress"}
 
     async with task_lock:
@@ -687,7 +634,7 @@ async def handle_task(body: dict):
         task_logger.info(f"TASK RECEIVED: {task!r}")
 
         if any(word in task.lower() for word in DANGEROUS_WORDS):
-            await send_to_lyra({"action": "speak", "text": "I cannot do that safely"})
+            await send_to_lyra_raw({"action": "speak", "text": "I cannot do that safely"})
             return {"success": False, "reason": "blocked"}
 
         fast_path_app = match_fast_path_app(task)
@@ -696,28 +643,28 @@ async def handle_task(body: dict):
             if os.path.exists(app_path):
                 subprocess.Popen(app_path)
                 await asyncio.sleep(0.5)
-                await send_to_lyra({"action": "task_done", "text": f"opened {fast_path_app}! ✨"})
+                await send_to_lyra_raw({"action": "task_done", "text": f"opened {fast_path_app}! ✨"})
                 return {"success": True, "steps": 1}
             # Path doesn't actually exist on this machine - fall through to
             # the full pipeline below, which has its own not-found handling
             # (win+s search) in execute_steps.
 
-        await send_to_lyra({"action": "thinking", "text": "let me figure that out..."})
+        await send_to_lyra_raw({"action": "thinking", "text": "let me figure that out..."})
 
         plan = await plan_steps(task)
         steps = plan["steps"][:MAX_STEPS]
         summary = plan["summary"]
 
         if summary:
-            await send_to_lyra({"action": "speak", "text": summary})
+            await send_to_lyra_raw({"action": "speak", "text": summary})
             await asyncio.sleep(1.5)
 
-        task_succeeded = await execute_steps(steps, send_to_lyra)
+        task_succeeded = await execute_steps(steps, send_to_lyra_raw)
 
         if task_succeeded:
-            await send_to_lyra({"action": "task_done", "text": "all done! ✨"})
+            await send_to_lyra_raw({"action": "task_done", "text": "all done! ✨"})
         else:
-            await send_to_lyra({
+            await send_to_lyra_raw({
                 "action": "task_failed",
                 "text": "I couldn't quite get that done, want me to try again?",
             })
@@ -872,10 +819,8 @@ async def create_profile(request: Request, body: dict):
         except Exception as error:
             print(f"Groq onboarding greeting call failed: {error}")
 
-    audio_b64 = await speak_text(reply_text, emotion)
-
     await send_to_lyra_raw(
-        {"action": "speak", "text": reply_text, "emotion": emotion, "audio": audio_b64}
+        {"action": "speak", "text": reply_text, "emotion": emotion}
     )
 
     if supabase_client:
@@ -922,7 +867,7 @@ async def handle_chat(request: Request, body: dict):
         return {"success": False, "reason": "empty message"}
 
     if any(word in message.lower() for word in DANGEROUS_WORDS):
-        await send_to_lyra({"action": "speak", "text": "I cannot do that safely"})
+        await send_to_lyra_raw({"action": "speak", "text": "I cannot do that safely"})
         return {"success": False, "reason": "blocked"}
 
     user_id = get_user_id(request)
@@ -1006,12 +951,8 @@ async def handle_chat(request: Request, body: dict):
 
     tokens_used_today = await add_daily_token_usage(user_id, tokens_used_this_call)
 
-    speak_start = time.perf_counter()
-    audio_b64 = await speak_text(reply_text, emotion)
-    speak_duration = time.perf_counter() - speak_start
-
     await send_to_lyra_raw(
-        {"action": "speak", "text": reply_text, "emotion": emotion, "audio": audio_b64}
+        {"action": "speak", "text": reply_text, "emotion": emotion}
     )
 
     insert_start = time.perf_counter()
@@ -1039,9 +980,8 @@ async def handle_chat(request: Request, body: dict):
     task_logger.info(
         f"CHAT TIMING: history_read={history_duration:.2f}s "
         f"groq_call={groq_duration:.2f}s "
-        f"speak_text={speak_duration:.2f}s "
         f"history_insert={insert_duration:.2f}s "
-        f"total={history_duration + groq_duration + speak_duration + insert_duration:.2f}s"
+        f"total={history_duration + groq_duration + insert_duration:.2f}s"
     )
 
     return {

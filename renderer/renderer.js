@@ -4,8 +4,11 @@ import { VRMLoaderPlugin, VRMUtils } from '@pixiv/three-vrm';
 
 const MODEL_URL = '../assets/lyra6.vrm';
 
-// Switch to 'http://localhost:8000' for local backend development.
 const BACKEND_URL = 'https://boltmos.up.railway.app';
+// /task (automation) always goes to the local backend, launched by
+// electron/main.js as boltmos-backend.exe - the cloud backend has no /task
+// endpoint since it can't drive this machine's screen/keyboard.
+const LOCAL_BACKEND_URL = 'http://localhost:8000';
 
 const canvas = document.getElementById('character-canvas');
 
@@ -521,7 +524,7 @@ async function sendChatMessage(text) {
   const isTask = isActionRequest(trimmed);
   const endpoint = isTask ? '/task' : '/chat';
   const payload = isTask ? { task: trimmed } : { message: trimmed };
-  const url = `${BACKEND_URL}${endpoint}`;
+  const url = isTask ? `${LOCAL_BACKEND_URL}${endpoint}` : `${BACKEND_URL}${endpoint}`;
   console.log('sendChatMessage fetching URL:', url);
 
   try {
@@ -545,6 +548,7 @@ async function sendChatMessage(text) {
     if (!isTask && data.text) {
       window.showSpeech?.(data.text);
       if (data.emotion) setEmotionState(data.emotion);
+      if (typeof data.audio === 'string' && data.audio) playAudioWithMouthSync(data.audio);
     }
   } catch (error) {
     console.error('sendChatMessage failed:', error);
