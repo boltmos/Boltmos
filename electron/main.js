@@ -106,7 +106,6 @@ function createWindow() {
   });
 
   win.loadFile(path.join(__dirname, '../renderer/index.html'));
-  win.webContents.openDevTools({ mode: 'detach' });
 
   win.webContents.on('console-message', (_event, _level, message) => {
     debugLog('[renderer]', message);
