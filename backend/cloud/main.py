@@ -52,6 +52,76 @@ async def health_check():
 
 GROQ_MODEL = "openai/gpt-oss-120b"
 
+MAX_STEPS = 5
+
+SYSTEM_PROMPT = """You convert user tasks into Windows PC steps.
+You are controlling a real Windows PC.
+Be very specific about timing - apps need time to load.
+
+STRICT RULE - READ FIRST:
+Only generate steps that are explicitly and literally requested in the user
+task, never assume additional steps, never add bonus actions, never open
+unrelated apps or websites. If the user says open chrome, the only step is
+opening chrome.
+Maximum of 5 steps total, no exceptions.
+
+Available actions:
+- open_app: opens application. value = app name.
+  Known apps: chrome, edge, notepad, calculator, spotify, file explorer.
+  Use wait: 0.3-0.5 for this step. These are minimums, not comfortable
+  defaults - do not pad them higher "to be safe".
+- navigate: types URL in browser address bar then presses enter.
+  value = full url like "youtube.com".
+  ALWAYS add wait: 1.0 before and expect 3 seconds to load
+- search_youtube: searches on YouTube using / shortcut.
+  value = search query. Only use when YouTube is already open.
+  Use wait: 0.5-0.8 before this step. These are minimums, not comfortable
+  defaults - do not pad them higher "to be safe".
+- search_google: searches Google directly.
+  value = search query. Use wait: 0.5-0.8 before this step. These are
+  minimums, not comfortable defaults - do not pad them higher "to be safe".
+- new_tab: opens new browser tab
+- click_target: finds and clicks something visible on screen.
+  value = description of element like "YouTube search bar" or "profile icon".
+  Use this instead of blind typing when possible.
+- extract_search_results: reads the search results currently on screen via
+  vision and captures their text. value not needed. Only use right after a
+  search (search_google/search_youtube/navigate) has finished loading.
+- type: types text. value = text. To type whatever extract_search_results
+  just captured, use value: "{{extracted_results}}" instead of literal text.
+- press: presses key. value = key name
+- hotkey: keyboard shortcut. value = "ctrl+t" etc
+- wait: waits. value = seconds as string
+
+CRITICAL RULES:
+1. open_app must always come first if app is not open
+2. navigate must wait for app to open first
+3. search_youtube only works after YouTube is fully loaded
+4. Always add enough wait time between steps
+5. For "open chrome and search youtube for X":
+   Step 1: open_app chrome (wait: 0.4)
+   Step 2: navigate to youtube.com (wait: 3.0)
+   Step 3: search_youtube for X (wait: 0.6)
+6. For "open chrome, search for best yc startups, and write the results in notepad":
+   Step 1: open_app chrome (wait: 0.4)
+   Step 2: search_google "best yc startups" (wait: 0.6)
+   Step 3: extract_search_results (wait: 1.0)
+   Step 4: open_app notepad (wait: 0.4)
+   Step 5: type "{{extracted_results}}" (wait: 3.5)
+
+Return JSON:
+{
+  "steps": [
+    {"action": "open_app", "value": "chrome",
+     "wait": 0.4, "message": "opening chrome!"},
+    {"action": "navigate", "value": "youtube.com",
+     "wait": 3.0, "message": "going to youtube!"},
+    {"action": "search_youtube", "value": "AI tutorials",
+     "wait": 0.6, "message": "searching for that!"}
+  ],
+  "summary": "I'll open Chrome, go to YouTube and search for AI tutorials"
+}"""
+
 groq_api_key = next(
     (key.strip() for key in os.getenv("GROQ_API_KEYS", "").split(",") if key.strip()),
     None,
@@ -343,6 +413,56 @@ async def create_profile(request: Request, body: dict):
 async def get_usage(request: Request):
     tokens_used = await get_daily_token_usage(get_user_id(request))
     return {"tokens_used": tokens_used, "token_limit": DAILY_TOKEN_LIMIT}
+
+
+async def plan_steps(task: str) -> dict:
+    fallback_steps = [{"action": "open_app", "value": task, "wait": 0.5}]
+
+    if not groq_client:
+        return {"steps": fallback_steps, "summary": ""}
+
+    try:
+        response = await asyncio.to_thread(
+            groq_client.chat.completions.create,
+            model=GROQ_MODEL,
+            messages=[
+                {"role": "system", "content": SYSTEM_PROMPT},
+                {"role": "user", "content": task},
+            ],
+            response_format={"type": "json_object"},
+        )
+        raw_content = response.choices[0].message.content
+        print("=" * 60)
+        print(f"RAW GROQ RESPONSE for task {task!r}:")
+        print(raw_content)
+        print("=" * 60)
+
+        result = json.loads(raw_content)
+        steps = result.get("steps") or fallback_steps
+        summary = result.get("summary", "")
+
+        if len(steps) > MAX_STEPS:
+            print(f"Groq returned {len(steps)} steps, truncating to MAX_STEPS={MAX_STEPS}")
+            steps = steps[:MAX_STEPS]
+
+        return {"steps": steps, "summary": summary}
+    except Exception as error:
+        print(f"Groq planning call failed: {error}")
+        return {"steps": fallback_steps, "summary": ""}
+
+
+@app.post("/plan")
+async def handle_plan(body: dict):
+    # Planning-only: this cloud backend has no local PyAutoGUI, so unlike
+    # /task on the local backend, this endpoint returns the plan for the
+    # caller to execute rather than executing it - see backend/main.py's
+    # handle_task, which now sources its plan from here (see plan_steps
+    # there) but still runs execute_steps() locally against this machine.
+    task = body.get("task", "")
+    if not task:
+        return {"steps": [], "summary": ""}
+
+    return await plan_steps(task)
 
 
 @app.post("/chat")

@@ -31,6 +31,10 @@
       {
         "from": "backend/dist/boltmos-backend",
         "to": "backend"
+      },
+      {
+        "from": "node_modules/three/examples/jsm",
+        "to": "app/node_modules/three/examples/jsm"
       }
     ],
     "win": {
