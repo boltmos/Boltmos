@@ -1,6 +1,4 @@
 import asyncio
-import base64
-import io
 import json
 import os
 import time
@@ -8,13 +6,10 @@ import uuid
 from datetime import date
 from pathlib import Path
 
-import numpy as np
-import soundfile as sf
 from dotenv import load_dotenv
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from groq import BadRequestError, Groq
-from kokoro import KPipeline
 from supabase import create_client, Client
 
 # Local dev convenience only - Railway injects env vars directly, so this is a
@@ -171,49 +166,17 @@ def get_user_id(request: Request) -> str:
     except ValueError:
         return TEST_USER_ID
 
-KOKORO_VOICE = "af_heart"
-KOKORO_SAMPLE_RATE = 24000
-# 1.0 is Kokoro's default pace for this voice pack - reads slightly slow/flat
-# for back-and-forth chat. Nudged up for a snappier conversational cadence;
-# Kokoro's own model card treats roughly 0.8-1.3 as the safe range before
-# articulation starts to degrade, so this has headroom either direction if it
-# needs retuning by ear.
-KOKORO_SPEED = 1.1
-
-try:
-    kokoro_pipeline = KPipeline(lang_code="a")
-except Exception as error:
-    kokoro_pipeline = None
-    print(f"Warning: Kokoro TTS failed to load, voice output disabled: {error}")
-
-
+# Kokoro (TTS) is disabled on this service for now - loading its model
+# (pulls in PyTorch) was causing the whole process to be OOM-killed on
+# Railway's 1GB tier, taking /chat and /plan down with it. A try/except
+# around KPipeline() couldn't catch this: an OOM kill is the OS sending
+# SIGKILL, not a raised Python exception, so no in-process handler runs.
+# Re-add once either the Railway plan is upgraded or Kokoro runs as its
+# own isolated service.
 async def speak_text(text: str, emotion: str) -> str:
-    """Generate speech audio for text with Kokoro's af_heart voice at
-    KOKORO_SPEED and return it as a base64-encoded WAV string ("" if Kokoro
-    isn't available or text is empty). emotion isn't fed into generation yet
-    - speed is currently the only per-call prosody control Kokoro exposes,
-    and it's fixed rather than emotion-driven - the param is accepted now so
-    callers/logging have it on hand for whenever emotion-driven voice tuning
-    (e.g. per-emotion speed) is added."""
-    if not kokoro_pipeline or not text:
-        return ""
-
-    def generate_audio_b64() -> str:
-        chunks = [
-            audio
-            for _, _, audio in kokoro_pipeline(text, voice=KOKORO_VOICE, speed=KOKORO_SPEED)
-        ]
-        full_audio = np.concatenate(chunks) if len(chunks) > 1 else chunks[0]
-        buffer = io.BytesIO()
-        sf.write(buffer, full_audio, KOKORO_SAMPLE_RATE, format="WAV")
-        buffer.seek(0)
-        return base64.b64encode(buffer.read()).decode()
-
-    try:
-        return await asyncio.to_thread(generate_audio_b64)
-    except Exception as error:
-        print(f"speak_text failed: {error}")
-        return ""
+    """Voice generation is disabled - always returns "" so callers (just
+    /chat) degrade to text-only rather than depend on audio being present."""
+    return ""
 
 
 DANGEROUS_WORDS = ["password", "bank", "payment", "credit card", "delete", "format"]
