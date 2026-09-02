@@ -8,3 +8,4 @@ dist/
 build/
 backend/logs/
 *.log
+CLAUDE.md.md
